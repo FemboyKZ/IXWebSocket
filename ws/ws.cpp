@@ -1359,7 +1359,7 @@ namespace ix
         args->compress = compress;
         args->compressRequest = compressRequest;
         args->logger = [](const std::string& msg) { spdlog::info(msg); };
-        args->onProgressCallback = [verbose](int current, int total) -> bool {
+        args->onProgressCallback = [verbose](uint64_t current, uint64_t total) -> bool {
             if (verbose)
             {
                 spdlog::info("Downloaded {} bytes out of {}", current, total);
@@ -2191,7 +2191,7 @@ namespace ix
 
         Bench bench("ws_send: Sending file through websocket");
         auto result =
-            _webSocket.sendBinary(serializedMsg, [this, throttle](int current, int total) -> bool {
+            _webSocket.sendBinary(serializedMsg, [this, throttle](uint64_t current, uint64_t total) -> bool {
                 spdlog::info("ws_send: Step {} out of {}", current + 1, total);
 
                 if (throttle)
@@ -2342,7 +2342,7 @@ namespace ix
                             {
                                 ++receivers;
                                 client->send(
-                                    msg->str, msg->binary, [&id](int current, int total) -> bool {
+                                    msg->str, msg->binary, [&id](uint64_t current, uint64_t total) -> bool {
                                         spdlog::info("{}: [client {}]: Step {} out of {}",
                                                      "ws_transfer",
                                                      id,

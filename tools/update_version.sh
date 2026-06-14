@@ -34,7 +34,7 @@ check_changelog() {
 }
 
 set_version() {
-    sed -i '' "s/$CUR_VSN/$NEW_VSN/g" $PROJECT_ROOT/ixwebsocket/IXWebSocketVersion.h
+    sed -i '' "s/$CUR_VSN/$NEW_VSN/g" $PROJECT_ROOT/include/ixwebsocket/IXWebSocketVersion.h
     echo "Set version to '$NEW_VSN'"
     exit 0
 }

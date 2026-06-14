@@ -92,10 +92,10 @@ namespace
             }
         });
 
-        _webSocket.enableAutomaticReconnection();
+        _webSocket.setAutomaticReconnection(true);
         REQUIRE(_webSocket.isAutomaticReconnectionEnabled() == true);
 
-        _webSocket.disableAutomaticReconnection();
+        _webSocket.setAutomaticReconnection(false);
         REQUIRE(_webSocket.isAutomaticReconnectionEnabled() == false);
 
         // Start the connection

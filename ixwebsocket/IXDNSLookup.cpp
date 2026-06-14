@@ -20,6 +20,7 @@
 #include "IXDNSLookup.h"
 
 #include "IXNetSystem.h"
+#include <atomic>
 #include <chrono>
 #include <string.h>
 #include <thread>
@@ -44,6 +45,40 @@
 namespace ix
 {
     const int64_t DNSLookup::kDefaultWait = 1; // ms
+
+    namespace
+    {
+        constexpr size_t kMaxCancellableDNSLookupThreads = 64;
+        std::atomic<size_t> activeCancellableDNSLookupThreads(0);
+
+        bool tryAcquireCancellableDNSLookupThread()
+        {
+            size_t current = activeCancellableDNSLookupThreads.load();
+            while (current < kMaxCancellableDNSLookupThreads)
+            {
+                if (activeCancellableDNSLookupThreads.compare_exchange_weak(current, current + 1))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        void releaseCancellableDNSLookupThread()
+        {
+            activeCancellableDNSLookupThreads.fetch_sub(1);
+        }
+
+        class CancellableDNSLookupThreadGuard
+        {
+        public:
+            ~CancellableDNSLookupThreadGuard()
+            {
+                releaseCancellableDNSLookupThread();
+            }
+        };
+    }
 
     DNSLookup::DNSLookup(const std::string& hostname, int port, int64_t wait)
         : _hostname(hostname)
@@ -90,7 +125,7 @@ namespace ix
         errMsg = "no error";
 
         // Maybe a cancellation request got in before the background thread terminated ?
-        if (isCancellationRequested())
+        if (isCancellationRequested && isCancellationRequested())
         {
             errMsg = "cancellation requested";
             return nullptr;
@@ -122,11 +157,26 @@ namespace ix
         int port = _port;
         std::string hostname(_hostname);
 
+        if (!tryAcquireCancellableDNSLookupThread())
+        {
+            errMsg = "too many cancellable DNS lookups in progress";
+            return nullptr;
+        }
+
         // We make the background thread doing the work a shared pointer
         // instead of a member variable, because it can keep running when
         // this object goes out of scope, in case of cancellation
-        auto t = std::make_shared<std::thread>(&DNSLookup::run, this, self, hostname, port);
-        t->detach();
+        try
+        {
+            auto t = std::make_shared<std::thread>(&DNSLookup::run, self, hostname, port);
+            t->detach();
+        }
+        catch (...)
+        {
+            releaseCancellableDNSLookupThread();
+            errMsg = "cannot start cancellable DNS lookup thread";
+            return nullptr;
+        }
 
         while (!_done)
         {
@@ -136,7 +186,7 @@ namespace ix
             std::this_thread::sleep_for(std::chrono::milliseconds(_wait));
 
             // Were we cancelled ?
-            if (isCancellationRequested())
+            if (isCancellationRequested && isCancellationRequested())
             {
                 errMsg = "cancellation requested";
                 return nullptr;
@@ -144,7 +194,7 @@ namespace ix
         }
 
         // Maybe a cancellation request got in before the bg terminated ?
-        if (isCancellationRequested())
+        if (isCancellationRequested && isCancellationRequested())
         {
             errMsg = "cancellation requested";
             return nullptr;
@@ -154,10 +204,10 @@ namespace ix
         return getRes();
     }
 
-    void DNSLookup::run(std::weak_ptr<DNSLookup> self,
-                        std::string hostname,
-                        int port) // thread runner
+    void DNSLookup::run(std::weak_ptr<DNSLookup> self, std::string hostname, int port)
     {
+        CancellableDNSLookupThreadGuard threadGuard;
+
         // We don't want to read or write into members variables of an object that could be
         // gone, so we use temporary variables (res) or we pass in by copy everything that
         // getAddrInfo needs to work.
@@ -167,10 +217,10 @@ namespace ix
         if (auto lock = self.lock())
         {
             // Copy result into the member variables
-            setRes(res);
-            setErrMsg(errMsg);
+            lock->setRes(res);
+            lock->setErrMsg(errMsg);
 
-            _done = true;
+            lock->_done = true;
         }
     }
 

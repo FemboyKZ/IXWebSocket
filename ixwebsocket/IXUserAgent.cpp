@@ -7,6 +7,7 @@
 #include "IXUserAgent.h"
 
 #include "IXWebSocketVersion.h"
+#include <mutex>
 #include <sstream>
 #ifdef IXWEBSOCKET_USE_ZLIB
 #include <zlib.h>
@@ -58,12 +59,16 @@ namespace ix
 {
     static std::string _customUserAgent;
     static std::string _customServerHeader;
+    static std::mutex _userAgentMutex;
 
     std::string userAgent()
     {
-        if (!_customUserAgent.empty())
         {
-            return _customUserAgent;
+            std::lock_guard<std::mutex> lock(_userAgentMutex);
+            if (!_customUserAgent.empty())
+            {
+                return _customUserAgent;
+            }
         }
 
         std::stringstream ss;
@@ -80,8 +85,8 @@ namespace ix
         ss << " ssl/mbedtls " << MBEDTLS_VERSION_STRING;
 #elif defined(IXWEBSOCKET_USE_OPEN_SSL)
         ss << " ssl/OpenSSL " << OPENSSL_VERSION_TEXT;
-#elif __APPLE__
-        ss << " ssl/SecureTransport";
+#else
+        ss << " ssl/unknown";
 #endif
 #else
         ss << " nossl";
@@ -97,21 +102,29 @@ namespace ix
 
     void setUserAgent(const std::string& userAgent)
     {
+        std::lock_guard<std::mutex> lock(_userAgentMutex);
         _customUserAgent = userAgent;
     }
 
     void setServerHeader(const std::string& server)
     {
+        std::lock_guard<std::mutex> lock(_userAgentMutex);
         _customServerHeader = server;
     }
 
     const std::string& getCustomUserAgent()
     {
-        return _customUserAgent;
+        static thread_local std::string userAgentSnapshot;
+        std::lock_guard<std::mutex> lock(_userAgentMutex);
+        userAgentSnapshot = _customUserAgent;
+        return userAgentSnapshot;
     }
 
     const std::string& getCustomServerHeader()
     {
-        return _customServerHeader;
+        static thread_local std::string serverHeaderSnapshot;
+        std::lock_guard<std::mutex> lock(_userAgentMutex);
+        serverHeaderSnapshot = _customServerHeader;
+        return serverHeaderSnapshot;
     }
 } // namespace ix

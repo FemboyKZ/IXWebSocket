@@ -5,6 +5,7 @@
  */
 
 #include "IXNetSystem.h"
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #ifdef _WIN32
@@ -104,6 +105,7 @@ namespace ix
     int poll(struct pollfd* fds, nfds_t nfds, int timeout, void** event)
     {
 #ifdef _WIN32
+        const bool infiniteTimeout = timeout < 0;
 
         if (event && *event)
         {
@@ -153,7 +155,12 @@ namespace ix
                 }
             }
 
-            DWORD n = WSAWaitForMultipleEvents(handles.size(), handles.data(), FALSE, timeout != -1 ? static_cast<DWORD>(timeout) : WSA_INFINITE, FALSE);
+            DWORD n = WSAWaitForMultipleEvents(handles.size(),
+                                               handles.data(),
+                                               FALSE,
+                                               infiniteTimeout ? WSA_INFINITE
+                                                               : static_cast<DWORD>(timeout),
+                                               FALSE);
 
             if (n == WSA_WAIT_FAILED) return SOCKET_ERROR;
             if (n == WSA_WAIT_TIMEOUT) return 0;
@@ -239,11 +246,15 @@ namespace ix
                 }
             }
 
-            struct timeval tv;
-            tv.tv_sec = timeout / 1000;
-            tv.tv_usec = (timeout % 1000) * 1000;
+            struct timeval tv{};
+            if (!infiniteTimeout)
+            {
+                tv.tv_sec = timeout / 1000;
+                tv.tv_usec = (timeout % 1000) * 1000;
+            }
 
-            int ret = select(maxfd + 1, &readfds, &writefds, &errorfds, timeout != -1 ? &tv : NULL);
+            int ret = select(
+                maxfd + 1, &readfds, &writefds, &errorfds, infiniteTimeout ? NULL : &tv);
 
             if (ret < 0)
             {
@@ -386,7 +397,7 @@ namespace ix
         {
             for (i = 0; i < 4; i++)
             {
-                for (v = j = 0; j < 3 && isdigit(s[j]); j++)
+                for (v = j = 0; j < 3 && std::isdigit(static_cast<unsigned char>(s[j])); j++)
                     v = 10 * v + s[j] - '0';
                 if (j == 0 || (j > 1 && s[0] == '0') || v > 255) return 0;
                 a[i] = v;

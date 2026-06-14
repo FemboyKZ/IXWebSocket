@@ -12,6 +12,7 @@ namespace ix
 
     ConnectionState::ConnectionState()
         : _terminated(false)
+        , _threadDone(false)
     {
         computeId();
     }
@@ -43,12 +44,33 @@ namespace ix
 
     void ConnectionState::setTerminated()
     {
-        _terminated = true;
+        if (_terminated.exchange(true))
+        {
+            return;
+        }
 
         if (_onSetTerminatedCallback)
         {
             _onSetTerminatedCallback();
         }
+    }
+
+    void ConnectionState::setThreadDone()
+    {
+        if (_threadDone.exchange(true))
+        {
+            return;
+        }
+
+        if (_onSetTerminatedCallback)
+        {
+            _onSetTerminatedCallback();
+        }
+    }
+
+    bool ConnectionState::isThreadDone() const
+    {
+        return _threadDone;
     }
 
     const std::string& ConnectionState::getRemoteIp()

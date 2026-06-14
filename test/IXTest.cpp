@@ -26,7 +26,19 @@ namespace ix
     std::atomic<size_t> incomingBytes(0);
     std::atomic<size_t> outgoingBytes(0);
     std::mutex TLogger::_mutex;
+    std::string TLogger::_lastMessage;
     std::stack<int> freePorts;
+
+    bool isTestLoggingEnabled()
+    {
+        static const bool enabled = [] {
+            const char* env = std::getenv("IX_TEST_LOG");
+            if (env == nullptr) return false;
+            return std::string(env) == "1";
+        }();
+
+        return enabled;
+    }
 
     void setupWebSocketTrafficTrackerCallback()
     {
@@ -44,7 +56,6 @@ namespace ix
 
     void reportWebSocketTraffic()
     {
-        TLogger() << incomingBytes;
         TLogger() << "Incoming bytes: " << incomingBytes;
         TLogger() << "Outgoing bytes: " << outgoingBytes;
     }
@@ -109,9 +120,9 @@ namespace ix
                 {
                     for (auto&& client : server.getClients())
                     {
-                        if (client.get() != &webSocket)
+                        if (client.first.get() != &webSocket)
                         {
-                            client->send(msg->str, msg->binary);
+                            client.first->send(msg->str, msg->binary);
                         }
                     }
                 }

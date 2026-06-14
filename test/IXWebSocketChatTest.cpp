@@ -218,9 +218,9 @@ namespace
                 {
                     for (auto&& client : server.getClients())
                     {
-                        if (client.get() != &webSocket)
+                        if (client.first.get() != &webSocket)
                         {
-                            client->sendBinary(msg->str);
+                            client.first->sendBinary(msg->str);
                         }
                     }
                 }

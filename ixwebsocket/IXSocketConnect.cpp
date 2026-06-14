@@ -83,6 +83,26 @@ namespace ix
             }
             else if (pollResult == PollResultType::ReadyForWrite)
             {
+                int socketError = 0;
+                socklen_t socketErrorLen = sizeof(socketError);
+                if (::getsockopt(fd,
+                                 SOL_SOCKET,
+                                 SO_ERROR,
+                                 reinterpret_cast<char*>(&socketError),
+                                 &socketErrorLen) < 0)
+                {
+                    errMsg = std::string("Connect error: ") + strerror(Socket::getErrno());
+                    Socket::closeSocket(fd);
+                    return -1;
+                }
+
+                if (socketError != 0)
+                {
+                    errMsg = std::string("Connect error: ") + strerror(socketError);
+                    Socket::closeSocket(fd);
+                    return -1;
+                }
+
                 return fd;
             }
             else

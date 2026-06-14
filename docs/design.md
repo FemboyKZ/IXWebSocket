@@ -6,7 +6,7 @@ The per message deflate compression option is supported. It can lead to very nic
 
 ### TLS/SSL
 
-Connections can be optionally secured and encrypted with TLS/SSL when using a wss:// endpoint, or using normal un-encrypted socket with ws:// endpoints. AppleSSL is used on iOS and macOS, OpenSSL and mbedTLS can be used on Android, Linux and Windows.
+Connections can be optionally secured and encrypted with TLS/SSL when using a wss:// endpoint, or using normal un-encrypted socket with ws:// endpoints. OpenSSL and mbedTLS can be used across supported platforms.
 
 If you are using OpenSSL, try to be on a version higher than 1.1.x as there there are thread safety problems with 1.0.x.
 
@@ -61,7 +61,6 @@ Here is a simplistic diagram which explains how the code is structured in term o
 +-----------------------+
 |                       |
 |  IXWebSocket          | ws://  Unencrypted Socket handler
-|  IXWebSocketAppleSSL  | wss:// TLS encrypted Socket AppleSSL handler. Used on iOS and macOS
 |  IXWebSocketOpenSSL   | wss:// TLS encrypted Socket OpenSSL handler.  Used on Android and Linux
 |                       |                                               Can be used on macOS too.
 +-----------------------+

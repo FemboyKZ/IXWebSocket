@@ -13,8 +13,6 @@
 #include "IXSocketMbedTLS.h"
 #elif defined(IXWEBSOCKET_USE_OPEN_SSL)
 #include "IXSocketOpenSSL.h"
-#elif __APPLE__
-#include "IXSocketAppleSSL.h"
 #endif
 
 #else
@@ -45,8 +43,6 @@ namespace ix
             socket = ix::make_unique<SocketMbedTLS>(tlsOptions, fd);
 #elif defined(IXWEBSOCKET_USE_OPEN_SSL)
             socket = ix::make_unique<SocketOpenSSL>(tlsOptions, fd);
-#elif defined(__APPLE__)
-            socket = ix::make_unique<SocketAppleSSL>(tlsOptions, fd);
 #endif
 #else
             errorMsg = "TLS support is not enabled on this platform.";

@@ -6,19 +6,29 @@
 
 #include "IXGzipCodec.h"
 
+#include <algorithm>
 #include <array>
+#include <limits>
 #include <string.h>
+#include <utility>
 
 #ifdef IXWEBSOCKET_USE_ZLIB
 #include <zlib.h>
 #endif
 
+namespace
+{
+    constexpr size_t kMaxGzipDecompressedSize = 64ULL * 1024ULL * 1024ULL;
+}
+
 namespace ix
 {
-    std::string gzipCompress(const std::string& str)
+    bool gzipCompress(const std::string& str, std::string& out)
     {
+        out.clear();
 #ifndef IXWEBSOCKET_USE_ZLIB
-        return std::string();
+        (void) str;
+        return false;
 #else
         z_stream zs{}; // z_stream is zlib's control structure
 
@@ -26,39 +36,75 @@ namespace ix
         const int windowBits = 15;
         const int GZIP_ENCODING = 16;
 
-        deflateInit2(&zs,
-                     Z_DEFAULT_COMPRESSION,
-                     Z_DEFLATED,
-                     windowBits | GZIP_ENCODING,
-                     8,
-                     Z_DEFAULT_STRATEGY);
+        if (deflateInit2(&zs,
+                         Z_DEFAULT_COMPRESSION,
+                         Z_DEFLATED,
+                         windowBits | GZIP_ENCODING,
+                         8,
+                         Z_DEFAULT_STRATEGY) != Z_OK)
+        {
+            return false;
+        }
 
-        zs.next_in = (Bytef*) str.data();
-        zs.avail_in = (uInt) str.size(); // set the z_stream's input
-
-        int ret;
+        const auto* input = reinterpret_cast<const Bytef*>(str.data());
+        size_t remaining = str.size();
+        int ret = Z_OK;
         char outbuffer[32768];
         std::string outstring;
 
         // retrieve the compressed bytes blockwise
-        do
+        while (ret != Z_STREAM_END)
         {
-            zs.next_out = reinterpret_cast<Bytef*>(outbuffer);
-            zs.avail_out = sizeof(outbuffer);
-
-            ret = deflate(&zs, Z_FINISH);
-
-            if (outstring.size() < zs.total_out)
+            if (zs.avail_in == 0 && remaining > 0)
             {
-                // append the block to the output string
-                outstring.append(outbuffer, zs.total_out - outstring.size());
+                const size_t inputSize =
+                    std::min(remaining, static_cast<size_t>(std::numeric_limits<uInt>::max()));
+                zs.next_in = const_cast<Bytef*>(input);
+                zs.avail_in = static_cast<uInt>(inputSize);
+                input += inputSize;
+                remaining -= inputSize;
             }
-        } while (ret == Z_OK);
+
+            const int flush = remaining == 0 ? Z_FINISH : Z_NO_FLUSH;
+
+            do
+            {
+                zs.next_out = reinterpret_cast<Bytef*>(outbuffer);
+                zs.avail_out = sizeof(outbuffer);
+
+                ret = deflate(&zs, flush);
+                if (ret != Z_OK && ret != Z_STREAM_END)
+                {
+                    deflateEnd(&zs);
+                    out.clear();
+                    return false;
+                }
+
+                const size_t outputSize = sizeof(outbuffer) - zs.avail_out;
+                if (outputSize > 0)
+                {
+                    outstring.append(outbuffer, outputSize);
+                }
+            } while (zs.avail_out == 0);
+
+            if (flush == Z_FINISH && zs.avail_in == 0 && ret != Z_STREAM_END)
+            {
+                continue;
+            }
+        }
 
         deflateEnd(&zs);
 
-        return outstring;
+        out = std::move(outstring);
+        return true;
 #endif // IXWEBSOCKET_USE_ZLIB
+    }
+
+    std::string gzipCompress(const std::string& str)
+    {
+        std::string out;
+        gzipCompress(str, out);
+        return out;
     }
 
 #ifdef IXWEBSOCKET_USE_DEFLATE
@@ -71,7 +117,15 @@ namespace ix
 
     bool gzipDecompress(const std::string& in, std::string& out)
     {
+        return gzipDecompress(in, out, kMaxGzipDecompressedSize);
+    }
+
+    bool gzipDecompress(const std::string& in, std::string& out, size_t maxOutputSize)
+    {
 #ifndef IXWEBSOCKET_USE_ZLIB
+        (void) in;
+        (void) out;
+        (void) maxOutputSize;
         return false;
 #else
         z_stream inflateState{};
@@ -81,28 +135,51 @@ namespace ix
             return false;
         }
 
-        inflateState.avail_in = (uInt) in.size();
-        inflateState.next_in = (unsigned char*) (const_cast<char*>(in.data()));
+        const auto* input = reinterpret_cast<const unsigned char*>(in.data());
+        size_t remaining = in.size();
+        out.clear();
 
         const int kBufferSize = 1 << 14;
         std::array<unsigned char, kBufferSize> compressBuffer;
 
-        do
+        int ret = Z_OK;
+        while (ret != Z_STREAM_END)
         {
-            inflateState.avail_out = (uInt) kBufferSize;
-            inflateState.next_out = &compressBuffer.front();
-
-            int ret = inflate(&inflateState, Z_SYNC_FLUSH);
-
-            if (ret == Z_NEED_DICT || ret == Z_DATA_ERROR || ret == Z_MEM_ERROR)
+            if (inflateState.avail_in == 0 && remaining > 0)
             {
-                inflateEnd(&inflateState);
-                return false;
+                const size_t inputSize =
+                    std::min(remaining, static_cast<size_t>(std::numeric_limits<uInt>::max()));
+                inflateState.next_in = const_cast<unsigned char*>(input);
+                inflateState.avail_in = static_cast<uInt>(inputSize);
+                input += inputSize;
+                remaining -= inputSize;
             }
 
-            out.append(reinterpret_cast<char*>(&compressBuffer.front()),
-                       kBufferSize - inflateState.avail_out);
-        } while (inflateState.avail_out == 0);
+            do
+            {
+                inflateState.avail_out = static_cast<uInt>(kBufferSize);
+                inflateState.next_out = &compressBuffer.front();
+
+                ret = inflate(&inflateState, Z_SYNC_FLUSH);
+
+                if (ret == Z_NEED_DICT || ret == Z_DATA_ERROR || ret == Z_MEM_ERROR ||
+                    ret == Z_BUF_ERROR)
+                {
+                    inflateEnd(&inflateState);
+                    return false;
+                }
+
+                const size_t outputSize = kBufferSize - inflateState.avail_out;
+                if (outputSize > maxOutputSize - out.size())
+                {
+                    inflateEnd(&inflateState);
+                    out.clear();
+                    return false;
+                }
+
+                out.append(reinterpret_cast<char*>(&compressBuffer.front()), outputSize);
+            } while (inflateState.avail_out == 0);
+        }
 
         inflateEnd(&inflateState);
         return true;

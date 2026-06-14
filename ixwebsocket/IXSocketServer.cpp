@@ -6,6 +6,7 @@
 
 #include "IXSocketServer.h"
 
+#include "IXCancellationRequest.h"
 #include "IXNetSystem.h"
 #include "IXSelectInterrupt.h"
 #include "IXSelectInterruptFactory.h"
@@ -17,6 +18,7 @@
 #include <sstream>
 #include <stdio.h>
 #include <string.h>
+#include <vector>
 
 namespace ix
 {
@@ -60,6 +62,7 @@ namespace ix
 
     void SocketServer::setOnAcceptErrorCallback(const OnAcceptErrorCallback& callback)
     {
+        std::lock_guard<std::mutex> lock(_configMutex);
         _onAcceptErrorCallback = callback;
     }
 
@@ -88,6 +91,11 @@ namespace ix
             return ss.str();
         }
 
+        auto closeServerFd = [this]() {
+            Socket::closeSocket(_serverFd);
+            _serverFd = -1;
+        };
+
         // Make that socket reusable. (allow restarting this server at will)
         int enable = 1;
         if (setsockopt(_serverFd, SOL_SOCKET, SO_REUSEADDR, (char*) &enable, sizeof(enable)) < 0)
@@ -95,7 +103,7 @@ namespace ix
             std::stringstream ss;
             ss << "SocketServer::listen() error calling setsockopt(SO_REUSEADDR) "
                << "at address " << _host << ":" << _port << " : " << strerror(Socket::getErrno());
-            Socket::closeSocket(_serverFd);
+            closeServerFd();
             return ss.str();
         }
 
@@ -111,7 +119,7 @@ namespace ix
                 ss << "SocketServer::listen() error calling inet_pton "
                    << "at address " << _host << ":" << _port << " : "
                    << strerror(Socket::getErrno());
-                Socket::closeSocket(_serverFd);
+                closeServerFd();
                 return ss.str();
             }
 
@@ -122,7 +130,7 @@ namespace ix
                 ss << "SocketServer::listen() error calling bind "
                    << "at address " << _host << ":" << _port << " : "
                    << strerror(Socket::getErrno());
-                Socket::closeSocket(_serverFd);
+                closeServerFd();
                 return ss.str();
             }
         }
@@ -138,7 +146,7 @@ namespace ix
                 ss << "SocketServer::listen() error calling inet_pton "
                    << "at address " << _host << ":" << _port << " : "
                    << strerror(Socket::getErrno());
-                Socket::closeSocket(_serverFd);
+                closeServerFd();
                 return ss.str();
             }
 
@@ -149,7 +157,7 @@ namespace ix
                 ss << "SocketServer::listen() error calling bind "
                    << "at address " << _host << ":" << _port << " : "
                    << strerror(Socket::getErrno());
-                Socket::closeSocket(_serverFd);
+                closeServerFd();
                 return ss.str();
             }
         }
@@ -162,7 +170,7 @@ namespace ix
             std::stringstream ss;
             ss << "SocketServer::listen() error calling listen "
                << "at address " << _host << ":" << _port << " : " << strerror(Socket::getErrno());
-            Socket::closeSocket(_serverFd);
+            closeServerFd();
             return ss.str();
         }
 
@@ -197,6 +205,13 @@ namespace ix
 
     void SocketServer::stop()
     {
+        std::lock_guard<std::mutex> stopLock(_stopMutex);
+        const bool calledFromConnectionThread = isCurrentThreadInConnectionThreads();
+        if (calledFromConnectionThread)
+        {
+            detachCurrentConnectionThread();
+        }
+
         // Stop accepting connections, and close the 'accept' thread
         if (_thread.joinable())
         {
@@ -220,18 +235,43 @@ namespace ix
                 _canContinueGC = true;
             }
             _conditionVariableGC.notify_one();
-            _gcThread.join();
-            _stopGc = false;
+            if (_gcThread.get_id() != std::this_thread::get_id())
+            {
+                _gcThread.join();
+                _stopGc = false;
+            }
         }
 
         _conditionVariable.notify_one();
-        Socket::closeSocket(_serverFd);
+        if (_serverFd != -1)
+        {
+            Socket::closeSocket(_serverFd);
+            _serverFd = -1;
+        }
     }
 
     void SocketServer::setConnectionStateFactory(
         const ConnectionStateFactory& connectionStateFactory)
     {
+        std::lock_guard<std::mutex> lock(_configMutex);
         _connectionStateFactory = connectionStateFactory;
+    }
+
+    bool SocketServer::isCurrentThreadInConnectionThreads()
+    {
+        const auto currentThreadId = std::this_thread::get_id();
+
+        std::lock_guard<std::mutex> lock(_connectionsThreadsMutex);
+        for (const auto& connectionThread : _connectionsThreads)
+        {
+            if (connectionThread.second.joinable() &&
+                connectionThread.second.get_id() == currentThreadId)
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     //
@@ -243,24 +283,60 @@ namespace ix
     //
     void SocketServer::closeTerminatedThreads()
     {
-        std::lock_guard<std::mutex> lock(_connectionsThreadsMutex);
-        auto it = _connectionsThreads.begin();
-        auto itEnd = _connectionsThreads.end();
+        std::vector<std::thread> threadsToJoin;
 
-        while (it != itEnd)
+        {
+            std::lock_guard<std::mutex> lock(_connectionsThreadsMutex);
+            auto it = _connectionsThreads.begin();
+            auto itEnd = _connectionsThreads.end();
+
+            while (it != itEnd)
+            {
+                auto& connectionState = it->first;
+                auto& thread = it->second;
+
+                if (!connectionState->isThreadDone())
+                {
+                    ++it;
+                    continue;
+                }
+
+                if (thread.joinable())
+                {
+                    threadsToJoin.emplace_back(std::move(thread));
+                }
+                it = _connectionsThreads.erase(it);
+            }
+        }
+
+        for (auto& thread : threadsToJoin)
+        {
+            if (thread.joinable()) thread.join();
+        }
+    }
+
+    bool SocketServer::detachCurrentConnectionThread()
+    {
+        const auto currentThreadId = std::this_thread::get_id();
+
+        std::lock_guard<std::mutex> lock(_connectionsThreadsMutex);
+        for (auto it = _connectionsThreads.begin(); it != _connectionsThreads.end(); ++it)
         {
             auto& connectionState = it->first;
-            auto& thread = it->second;
-
-            if (!connectionState->isTerminated())
+            auto& connectionThread = it->second;
+            if (connectionThread.joinable() && connectionThread.get_id() == currentThreadId)
             {
-                ++it;
-                continue;
+                connectionThread.detach();
+                if (connectionState)
+                {
+                    connectionState->setOnSetTerminatedCallback(nullptr);
+                }
+                _connectionsThreads.erase(it);
+                return true;
             }
-
-            if (thread.joinable()) thread.join();
-            it = _connectionsThreads.erase(it);
         }
+
+        return false;
     }
 
     void SocketServer::run()
@@ -275,7 +351,10 @@ namespace ix
 
         for (;;)
         {
-            if (_stop) return;
+            if (_stop)
+            {
+                return;
+            }
 
             // Use poll to check whether a new connection is in progress
             int timeoutMs = -1;
@@ -316,15 +395,32 @@ namespace ix
                        << strerror(err);
                     std::string errMsg = ss.str();
                     logError(errMsg);
-                    if (_onAcceptErrorCallback)
+                    OnAcceptErrorCallback onAcceptErrorCallback;
                     {
-                        _onAcceptErrorCallback(errMsg);
+                        std::lock_guard<std::mutex> lock(_configMutex);
+                        onAcceptErrorCallback = _onAcceptErrorCallback;
+                    }
+                    if (onAcceptErrorCallback)
+                    {
+                        onAcceptErrorCallback(errMsg);
                     }
                 }
                 continue;
             }
 
-            if (getConnectedClientsCount() >= _maxConnections)
+            if (client.ss_family != AF_INET && client.ss_family != AF_INET6)
+            {
+                std::stringstream ss;
+                ss << "SocketServer::run() accepted unsupported address family: "
+                   << client.ss_family;
+                logError(ss.str());
+
+                Socket::closeSocket(clientFd);
+
+                continue;
+            }
+
+            if (getConnectionsThreadsCount() >= _maxConnections)
             {
                 std::stringstream ss;
                 ss << "SocketServer::run() reached max connections = " << _maxConnections << ". "
@@ -383,20 +479,44 @@ namespace ix
             }
 
             std::shared_ptr<ConnectionState> connectionState;
-            if (_connectionStateFactory)
+            ConnectionStateFactory connectionStateFactory;
             {
-                connectionState = _connectionStateFactory();
+                std::lock_guard<std::mutex> lock(_configMutex);
+                connectionStateFactory = _connectionStateFactory;
             }
+            if (connectionStateFactory)
+            {
+                connectionState = connectionStateFactory();
+            }
+
+            if (!connectionState)
+            {
+                logError("SocketServer::run() connection state factory returned null");
+                Socket::closeSocket(clientFd);
+                continue;
+            }
+
             connectionState->setOnSetTerminatedCallback([this] { onSetTerminatedCallback(); });
             connectionState->setRemoteIp(remoteIp);
             connectionState->setRemotePort(remotePort);
 
-            if (_stop) return;
+            if (_stop)
+            {
+                Socket::closeSocket(clientFd);
+                return;
+            }
 
             // create socket
             std::string errorMsg;
-            bool tls = _socketTLSOptions.tls;
-            auto socket = createSocket(tls, clientFd, errorMsg, _socketTLSOptions);
+            SocketTLSOptions socketTLSOptions;
+            int socketAcceptTimeoutSecs = -1;
+            {
+                std::lock_guard<std::mutex> lock(_configMutex);
+                socketTLSOptions = _socketTLSOptions;
+            }
+            socketAcceptTimeoutSecs = getSocketAcceptTimeoutSecs();
+            bool tls = socketTLSOptions.tls;
+            auto socket = createSocket(tls, clientFd, errorMsg, socketTLSOptions);
 
             if (socket == nullptr)
             {
@@ -408,20 +528,36 @@ namespace ix
             // Set the socket to non blocking mode + other tweaks
             SocketConnect::configureSocket(clientFd);
 
-            if (!socket->accept(errorMsg))
-            {
-                logError("SocketServer::run() tls accept failed: " + errorMsg);
-                Socket::closeSocket(clientFd);
-                continue;
-            }
-
             // Launch the handleConnection work asynchronously in its own thread.
             std::lock_guard<std::mutex> lock(_connectionsThreadsMutex);
             _connectionsThreads.push_back(std::make_pair(
                 connectionState,
-                std::thread(
-                    &SocketServer::handleConnection, this, std::move(socket), connectionState)));
+                std::thread(&SocketServer::runConnection,
+                            this,
+                            std::move(socket),
+                            connectionState,
+                            socketAcceptTimeoutSecs)));
         }
+    }
+
+    void SocketServer::runConnection(std::unique_ptr<Socket> socket,
+                                     std::shared_ptr<ConnectionState> connectionState,
+                                     int socketAcceptTimeoutSecs)
+    {
+        std::string errorMsg;
+        std::atomic<bool> requestInitCancellation(false);
+        auto isCancellationRequested =
+            makeCancellationRequestWithTimeout(socketAcceptTimeoutSecs, requestInitCancellation);
+        if (!socket->accept(errorMsg, isCancellationRequested))
+        {
+            logError("SocketServer::runConnection() socket accept failed: " + errorMsg);
+            connectionState->setTerminated();
+            connectionState->setThreadDone();
+            return;
+        }
+
+        handleConnection(std::move(socket), connectionState);
+        connectionState->setThreadDone();
     }
 
     size_t SocketServer::getConnectionsThreadsCount()
@@ -465,7 +601,13 @@ namespace ix
 
     void SocketServer::setTLSOptions(const SocketTLSOptions& socketTLSOptions)
     {
+        std::lock_guard<std::mutex> lock(_configMutex);
         _socketTLSOptions = socketTLSOptions;
+    }
+
+    int SocketServer::getSocketAcceptTimeoutSecs()
+    {
+        return -1;
     }
 
     void SocketServer::onSetTerminatedCallback()

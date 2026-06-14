@@ -6,19 +6,21 @@
 
 #include "IXWebSocketServer.h"
 
+#include "IXHttp.h"
 #include "IXNetSystem.h"
 #include <algorithm>
 #include "IXSetThreadName.h"
 #include "IXSocketConnect.h"
 #include "IXWebSocket.h"
 #include "IXWebSocketTransport.h"
+#include <exception>
 #include <future>
 #include <sstream>
 #include <string.h>
 
 namespace ix
 {
-    const int WebSocketServer::kDefaultHandShakeTimeoutSecs(5); // 5 seconds
+    const int WebSocketServer::kDefaultHandShakeTimeoutSecs(60); // 60 seconds
     const bool WebSocketServer::kDefaultEnablePong(true);
     const int WebSocketServer::kPingIntervalSeconds(-1); // disable heartbeat
 
@@ -58,26 +60,36 @@ namespace ix
 
     void WebSocketServer::setPong(bool enabled)
     {
+        std::lock_guard<std::mutex> lock(_configMutex);
         _enablePong = enabled;
     }
 
     void WebSocketServer::setPerMessageDeflate(bool enabled)
     {
+        std::lock_guard<std::mutex> lock(_configMutex);
         _enablePerMessageDeflate = enabled;
     }
 
     void WebSocketServer::addSubProtocol(const std::string& subProtocol)
     {
+        if (!isValidHttpHeaderName(subProtocol))
+        {
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(_configMutex);
         _subProtocols.push_back(subProtocol);
     }
 
     void WebSocketServer::clearSubProtocols()
     {
+        std::lock_guard<std::mutex> lock(_configMutex);
         _subProtocols.clear();
     }
 
     void WebSocketServer::removeSubProtocol(const std::string& subProtocol)
     {
+        std::lock_guard<std::mutex> lock(_configMutex);
         _subProtocols.erase(
             std::remove(_subProtocols.begin(), _subProtocols.end(), subProtocol),
             _subProtocols.end());
@@ -85,21 +97,25 @@ namespace ix
 
     void WebSocketServer::setTimeouts(const WebSocketTimeouts& timeouts)
     {
+        std::lock_guard<std::mutex> lock(_configMutex);
         _timeouts = timeouts;
     }
 
-    const WebSocketTimeouts& WebSocketServer::getTimeouts() const
+    WebSocketTimeouts WebSocketServer::getTimeouts() const
     {
+        std::lock_guard<std::mutex> lock(_configMutex);
         return _timeouts;
     }
 
     void WebSocketServer::setMaxConnectionsPerIp(size_t maxConnections)
     {
+        std::lock_guard<std::mutex> lock(_rateLimitMutex);
         _maxConnectionsPerIp = maxConnections;
     }
 
     size_t WebSocketServer::getMaxConnectionsPerIp() const
     {
+        std::lock_guard<std::mutex> lock(_rateLimitMutex);
         return _maxConnectionsPerIp;
     }
 
@@ -112,11 +128,13 @@ namespace ix
 
     void WebSocketServer::setOnConnectionCallback(const OnConnectionCallback& callback)
     {
+        std::lock_guard<std::mutex> lock(_configMutex);
         _onConnectionCallback = callback;
     }
 
     void WebSocketServer::setOnClientMessageCallback(const OnClientMessageCallback& callback)
     {
+        std::lock_guard<std::mutex> lock(_configMutex);
         _onClientMessageCallback = callback;
     }
 
@@ -135,6 +153,17 @@ namespace ix
         setThreadName("Srv:ws:" + connectionState->getId());
 
         std::string remoteIp = connectionState->getRemoteIp();
+        auto decrementConnectionCount = [&]() {
+            std::lock_guard<std::mutex> lock(_rateLimitMutex);
+            auto it = _connectionsPerIp.find(remoteIp);
+            if (it != _connectionsPerIp.end() && it->second > 0)
+            {
+                if (--it->second == 0)
+                {
+                    _connectionsPerIp.erase(it);
+                }
+            }
+        };
 
         // Track connections per IP and check rate limit
         {
@@ -150,13 +179,50 @@ namespace ix
 
         auto webSocket = std::make_shared<WebSocket>();
 
-        webSocket->setAutoThreadName(false);
-        webSocket->setPingInterval(_pingIntervalSeconds);
-        webSocket->setTimeouts(_timeouts);
-
-        if (_onConnectionCallback)
+        int pingIntervalSeconds = 0;
+        int handshakeTimeoutSecs = 0;
+        bool enablePong = false;
+        bool enablePerMessageDeflate = false;
+        WebSocketTimeouts timeouts;
+        std::vector<std::string> subProtocols;
+        OnConnectionCallback onConnectionCallback;
+        OnClientMessageCallback onClientMessageCallback;
         {
-            _onConnectionCallback(webSocket, connectionState);
+            std::lock_guard<std::mutex> lock(_configMutex);
+            pingIntervalSeconds = _pingIntervalSeconds;
+            handshakeTimeoutSecs = _handshakeTimeoutSecs;
+            enablePong = _enablePong;
+            enablePerMessageDeflate = _enablePerMessageDeflate;
+            timeouts = _timeouts;
+            subProtocols = _subProtocols;
+            onConnectionCallback = _onConnectionCallback;
+            onClientMessageCallback = _onClientMessageCallback;
+        }
+
+        webSocket->setAutoThreadName(false);
+        webSocket->setPingInterval(pingIntervalSeconds);
+        webSocket->setTimeouts(timeouts);
+
+        if (onConnectionCallback)
+        {
+            try
+            {
+                onConnectionCallback(webSocket, connectionState);
+            }
+            catch (const std::exception& e)
+            {
+                logError(std::string("WebSocketServer connection callback threw: ") + e.what());
+                connectionState->setTerminated();
+                decrementConnectionCount();
+                return;
+            }
+            catch (...)
+            {
+                logError("WebSocketServer connection callback threw");
+                connectionState->setTerminated();
+                decrementConnectionCount();
+                return;
+            }
 
             if (!webSocket->isOnMessageCallbackRegistered())
             {
@@ -164,15 +230,17 @@ namespace ix
                          "registered.");
                 logError("Missing call to setOnMessageCallback inside setOnConnectionCallback.");
                 connectionState->setTerminated();
+                decrementConnectionCount();
                 return;
             }
         }
-        else if (_onClientMessageCallback)
+        else if (onClientMessageCallback)
         {
             WebSocket* webSocketRawPtr = webSocket.get();
             webSocket->setOnMessageCallback(
-                [this, webSocketRawPtr, connectionState](const WebSocketMessagePtr& msg)
-                { _onClientMessageCallback(connectionState, *webSocketRawPtr, msg); });
+                [onClientMessageCallback, webSocketRawPtr, connectionState](
+                    const WebSocketMessagePtr& msg)
+                { onClientMessageCallback(connectionState, *webSocketRawPtr, msg); });
         }
         else
         {
@@ -180,11 +248,12 @@ namespace ix
                 "WebSocketServer Application developer error: No server callback is registerered.");
             logError("Missing call to setOnConnectionCallback or setOnClientMessageCallback.");
             connectionState->setTerminated();
+            decrementConnectionCount();
             return;
         }
 
         webSocket->setAutomaticReconnection(false);
-        webSocket->setPong(_enablePong);
+        webSocket->setPong(enablePong);
 
         // Add this client to our client map
         {
@@ -192,8 +261,11 @@ namespace ix
             _clients[webSocket] = connectionState;
         }
 
-        auto status = webSocket->connectToSocket(
-            std::move(socket), _handshakeTimeoutSecs, _enablePerMessageDeflate, request, _subProtocols);
+        auto status = webSocket->connectToSocket(std::move(socket),
+                                                 handshakeTimeoutSecs,
+                                                 enablePerMessageDeflate,
+                                                 request,
+                                                 subProtocols);
         if (status.success)
         {
             // Process incoming messages and execute callbacks
@@ -219,18 +291,7 @@ namespace ix
             }
         }
 
-        // Decrement connection counter
-        {
-            std::lock_guard<std::mutex> lock(_rateLimitMutex);
-            auto it = _connectionsPerIp.find(remoteIp);
-            if (it != _connectionsPerIp.end() && it->second > 0)
-            {
-                if (--it->second == 0)
-                {
-                    _connectionsPerIp.erase(it);
-                }
-            }
-        }
+        decrementConnectionCount();
     }
 
     std::map<std::shared_ptr<WebSocket>, std::shared_ptr<ConnectionState>> WebSocketServer::getClients()
@@ -264,27 +325,13 @@ namespace ix
     void WebSocketServer::makeBroadcastServer()
     {
         setOnClientMessageCallback(
-            [this](std::shared_ptr<ConnectionState> connectionState,
+            [this](std::shared_ptr<ConnectionState>,
                    WebSocket& webSocket,
                    const WebSocketMessagePtr& msg)
             {
-                auto remoteIp = connectionState->getRemoteIp();
                 if (msg->type == ix::WebSocketMessageType::Message)
                 {
-                    for (auto&& [client, state] : getClients())
-                    {
-                        if (client.get() != &webSocket)
-                        {
-                            client->send(msg->str, msg->binary);
-
-                            // Make sure the OS send buffer is flushed before moving on
-                            do
-                            {
-                                std::chrono::duration<double, std::milli> duration(500);
-                                std::this_thread::sleep_for(duration);
-                            } while (client->bufferedAmount() != 0);
-                        }
-                    }
+                    broadcast(msg->str, msg->binary, &webSocket);
                 }
             });
     }
@@ -315,21 +362,34 @@ namespace ix
 
     int WebSocketServer::getHandshakeTimeoutSecs()
     {
+        std::lock_guard<std::mutex> lock(_configMutex);
         return _handshakeTimeoutSecs;
     }
 
     void WebSocketServer::setHandshakeTimeoutSecs(int secs)
     {
+        if (secs < -1)
+        {
+            secs = -1;
+        }
+        std::lock_guard<std::mutex> lock(_configMutex);
         _handshakeTimeoutSecs = secs;
+    }
+
+    int WebSocketServer::getSocketAcceptTimeoutSecs()
+    {
+        return getHandshakeTimeoutSecs();
     }
 
     bool WebSocketServer::isPongEnabled()
     {
+        std::lock_guard<std::mutex> lock(_configMutex);
         return _enablePong;
     }
 
     bool WebSocketServer::isPerMessageDeflateEnabled()
     {
+        std::lock_guard<std::mutex> lock(_configMutex);
         return _enablePerMessageDeflate;
     }
 } // namespace ix

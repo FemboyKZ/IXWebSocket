@@ -62,7 +62,7 @@ namespace
         }
 
         _webSocket.setUrl(url);
-        _webSocket.disableAutomaticReconnection();
+        _webSocket.setAutomaticReconnection(false);
 
         std::stringstream ss;
         log(std::string("Connecting to url: ") + url);

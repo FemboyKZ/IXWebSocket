@@ -6,14 +6,12 @@
 cmake_minimum_required(VERSION 3.4.1...3.17.2)
 set(CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/CMake;${CMAKE_MODULE_PATH}")
 
-project(ixwebsocket LANGUAGES C CXX VERSION 11.4.6)
+project(ixwebsocket LANGUAGES C CXX VERSION 12.0.3)
 
 set (CMAKE_CXX_STANDARD 17)
 set (CXX_STANDARD_REQUIRED ON)
 set (CMAKE_CXX_EXTENSIONS OFF)
 set (CMAKE_EXPORT_COMPILE_COMMANDS yes)
-
-option (BUILD_DEMO OFF)
 
 if (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
   set(CMAKE_POSITION_INDEPENDENT_CODE ON)
@@ -44,6 +42,7 @@ set( IXWEBSOCKET_SOURCES
     ixwebsocket/IXSelectInterruptFactory.cpp
     ixwebsocket/IXSelectInterruptPipe.cpp
     ixwebsocket/IXSelectInterruptEvent.cpp
+    ixwebsocket/IXSecureRandom.cpp
     ixwebsocket/IXSetThreadName.cpp
     ixwebsocket/IXProxyConfig.cpp
     ixwebsocket/IXProxyConnect.cpp
@@ -70,75 +69,71 @@ set( IXWEBSOCKET_SOURCES
 )
 
 set( IXWEBSOCKET_HEADERS
-    ixwebsocket/IXBase64.h
-    ixwebsocket/IXBench.h
-    ixwebsocket/IXCancellationRequest.h
-    ixwebsocket/IXConnectionState.h
-    ixwebsocket/IXDNSLookup.h
-    ixwebsocket/IXExponentialBackoff.h
-    ixwebsocket/IXGetFreePort.h
-    ixwebsocket/IXGzipCodec.h
-    ixwebsocket/IXHttp.h
-    ixwebsocket/IXHttpClient.h
-    ixwebsocket/IXHttpConnectionPool.h
-    ixwebsocket/IXHttpServer.h
-    ixwebsocket/IXIoResult.h
-    ixwebsocket/IXNetSystem.h
-    ixwebsocket/IXProgressCallback.h
-    ixwebsocket/IXProxyConfig.h
-    ixwebsocket/IXProxyConnect.h
-    ixwebsocket/IXSelectInterrupt.h
-    ixwebsocket/IXSelectInterruptFactory.h
-    ixwebsocket/IXSelectInterruptPipe.h
-    ixwebsocket/IXSelectInterruptEvent.h
-    ixwebsocket/IXSetThreadName.h
-    ixwebsocket/IXSocket.h
-    ixwebsocket/IXSocketConnect.h
-    ixwebsocket/IXSocketFactory.h
-    ixwebsocket/IXSocketServer.h
-    ixwebsocket/IXSocketTLSOptions.h
-    ixwebsocket/IXStrCaseCompare.h
-    ixwebsocket/IXUdpSocket.h
-    ixwebsocket/IXUniquePtr.h
-    ixwebsocket/IXUrlParser.h
-    ixwebsocket/IXUuid.h
-    ixwebsocket/IXUtf8Validator.h
-    ixwebsocket/IXUserAgent.h
-    ixwebsocket/IXWebSocket.h
-    ixwebsocket/IXWebSocketCloseConstants.h
-    ixwebsocket/IXWebSocketCloseInfo.h
-    ixwebsocket/IXWebSocketErrorInfo.h
-    ixwebsocket/IXWebSocketHandshake.h
-    ixwebsocket/IXWebSocketHandshakeKeyGen.h
-    ixwebsocket/IXWebSocketHttpHeaders.h
-    ixwebsocket/IXWebSocketInitResult.h
-    ixwebsocket/IXWebSocketMessage.h
-    ixwebsocket/IXWebSocketMessageType.h
-    ixwebsocket/IXWebSocketOpenInfo.h
-    ixwebsocket/IXWebSocketPerMessageDeflate.h
-    ixwebsocket/IXWebSocketPerMessageDeflateCodec.h
-    ixwebsocket/IXWebSocketPerMessageDeflateOptions.h
-    ixwebsocket/IXWebSocketProxyServer.h
-    ixwebsocket/IXWebSocketSendData.h
-    ixwebsocket/IXWebSocketSendInfo.h
-    ixwebsocket/IXWebSocketServer.h
-    ixwebsocket/IXWebSocketStats.h
-    ixwebsocket/IXWebSocketTimeouts.h
-    ixwebsocket/IXWebSocketTransport.h
-    ixwebsocket/IXWebSocketVersion.h
+    include/ixwebsocket/IXBase64.h
+    include/ixwebsocket/IXBench.h
+    include/ixwebsocket/IXCancellationRequest.h
+    include/ixwebsocket/IXConnectionState.h
+    include/ixwebsocket/IXDNSLookup.h
+    include/ixwebsocket/IXExponentialBackoff.h
+    include/ixwebsocket/IXGetFreePort.h
+    include/ixwebsocket/IXGzipCodec.h
+    include/ixwebsocket/IXHttp.h
+    include/ixwebsocket/IXHttpClient.h
+    include/ixwebsocket/IXHttpConnectionPool.h
+    include/ixwebsocket/IXHttpServer.h
+    include/ixwebsocket/IXIoResult.h
+    include/ixwebsocket/IXNetSystem.h
+    include/ixwebsocket/IXProgressCallback.h
+    include/ixwebsocket/IXProxyConfig.h
+    include/ixwebsocket/IXProxyConnect.h
+    include/ixwebsocket/IXSelectInterrupt.h
+    include/ixwebsocket/IXSelectInterruptFactory.h
+    include/ixwebsocket/IXSelectInterruptPipe.h
+    include/ixwebsocket/IXSelectInterruptEvent.h
+    include/ixwebsocket/IXSecureRandom.h
+    include/ixwebsocket/IXSetThreadName.h
+    include/ixwebsocket/IXSocket.h
+    include/ixwebsocket/IXSocketConnect.h
+    include/ixwebsocket/IXSocketFactory.h
+    include/ixwebsocket/IXSocketServer.h
+    include/ixwebsocket/IXSocketTLSOptions.h
+    include/ixwebsocket/IXStrCaseCompare.h
+    include/ixwebsocket/IXUdpSocket.h
+    include/ixwebsocket/IXUniquePtr.h
+    include/ixwebsocket/IXUrlParser.h
+    include/ixwebsocket/IXUuid.h
+    include/ixwebsocket/IXUtf8Validator.h
+    include/ixwebsocket/IXUserAgent.h
+    include/ixwebsocket/IXWebSocket.h
+    include/ixwebsocket/IXWebSocketCloseConstants.h
+    include/ixwebsocket/IXWebSocketCloseInfo.h
+    include/ixwebsocket/IXWebSocketErrorInfo.h
+    include/ixwebsocket/IXWebSocketHandshake.h
+    include/ixwebsocket/IXWebSocketHandshakeKeyGen.h
+    include/ixwebsocket/IXWebSocketHttpHeaders.h
+    include/ixwebsocket/IXWebSocketInitResult.h
+    include/ixwebsocket/IXWebSocketMessage.h
+    include/ixwebsocket/IXWebSocketMessageType.h
+    include/ixwebsocket/IXWebSocketOpenInfo.h
+    include/ixwebsocket/IXWebSocketPerMessageDeflate.h
+    include/ixwebsocket/IXWebSocketPerMessageDeflateCodec.h
+    include/ixwebsocket/IXWebSocketPerMessageDeflateOptions.h
+    include/ixwebsocket/IXWebSocketProxyServer.h
+    include/ixwebsocket/IXWebSocketSendData.h
+    include/ixwebsocket/IXWebSocketSendInfo.h
+    include/ixwebsocket/IXWebSocketServer.h
+    include/ixwebsocket/IXWebSocketStats.h
+    include/ixwebsocket/IXWebSocketTimeouts.h
+    include/ixwebsocket/IXWebSocketTransport.h
+    include/ixwebsocket/IXWebSocketVersion.h
 )
 
 option(BUILD_SHARED_LIBS "Build shared libraries (.dll/.so) instead of static ones (.lib/.a)" OFF)
 option(USE_TLS "Enable TLS support" FALSE)
 
 if (USE_TLS)
-    # default to securetranport on Apple if nothing is configured
-    if (APPLE)
-      if (NOT USE_MBED_TLS AND NOT USE_OPEN_SSL) # unless we want something else
-        set(USE_SECURE_TRANSPORT ON)
-      endif()
     # default to mbedtls on windows if nothing is configured
-    elseif (WIN32)
+    if (WIN32)
       if (NOT USE_OPEN_SSL) # unless we want something else
         set(USE_MBED_TLS ON)
       endif()
@@ -150,13 +145,10 @@ if (USE_TLS)
     endif()
 
     if (USE_MBED_TLS)
-        list( APPEND IXWEBSOCKET_HEADERS ixwebsocket/IXSocketMbedTLS.h)
+        list( APPEND IXWEBSOCKET_HEADERS include/ixwebsocket/IXSocketMbedTLS.h)
         list( APPEND IXWEBSOCKET_SOURCES ixwebsocket/IXSocketMbedTLS.cpp)
-    elseif (USE_SECURE_TRANSPORT)
-        list( APPEND IXWEBSOCKET_HEADERS ixwebsocket/IXSocketAppleSSL.h)
-        list( APPEND IXWEBSOCKET_SOURCES ixwebsocket/IXSocketAppleSSL.cpp)
     elseif (USE_OPEN_SSL)
-        list( APPEND IXWEBSOCKET_HEADERS ixwebsocket/IXSocketOpenSSL.h)
+        list( APPEND IXWEBSOCKET_HEADERS include/ixwebsocket/IXSocketOpenSSL.h)
         list( APPEND IXWEBSOCKET_SOURCES ixwebsocket/IXSocketOpenSSL.cpp)
     else()
         message(FATAL_ERROR "TLS Configuration error: unknown backend")
@@ -192,8 +184,6 @@ if (USE_TLS)
         target_compile_definitions(ixwebsocket PUBLIC IXWEBSOCKET_USE_MBED_TLS)
     elseif (USE_OPEN_SSL)
         target_compile_definitions(ixwebsocket PUBLIC IXWEBSOCKET_USE_OPEN_SSL)
-    elseif (USE_SECURE_TRANSPORT)
-        target_compile_definitions(ixwebsocket PUBLIC IXWEBSOCKET_USE_SECURE_TRANSPORT)
     else()
         message(FATAL_ERROR "TLS Configuration error: unknown backend")
     endif()
@@ -236,9 +226,6 @@ if (USE_TLS)
     endif()
     target_include_directories(ixwebsocket PUBLIC $<BUILD_INTERFACE:${MBEDTLS_INCLUDE_DIRS}>)
     target_link_libraries(ixwebsocket PRIVATE ${MBEDTLS_LIBRARIES})
-  elseif (USE_SECURE_TRANSPORT)
-    message(STATUS "TLS configured to use secure transport")
-    target_link_libraries(ixwebsocket PRIVATE "-framework Foundation" "-framework Security")
   endif()
 endif()
 
@@ -252,7 +239,7 @@ if (USE_ZLIB)
 endif()
 
 if (WIN32)
-  target_link_libraries(ixwebsocket PRIVATE wsock32 ws2_32 shlwapi)
+  target_link_libraries(ixwebsocket PRIVATE wsock32 ws2_32 shlwapi bcrypt)
   target_compile_definitions(ixwebsocket PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX)
 
   if (USE_TLS)
@@ -268,7 +255,7 @@ endif()
 
 
 set( IXWEBSOCKET_INCLUDE_DIRS
-    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 
 if (CMAKE_CXX_COMPILER_ID MATCHES "MSVC")
@@ -278,9 +265,12 @@ endif()
 
 include(GNUInstallDirs)
 
-target_include_directories(ixwebsocket PUBLIC
-  $<BUILD_INTERFACE:${IXWEBSOCKET_INCLUDE_DIRS}/>
-  $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/ixwebsocket>
+target_include_directories(ixwebsocket
+  PUBLIC
+    $<BUILD_INTERFACE:${IXWEBSOCKET_INCLUDE_DIRS}/>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+  PRIVATE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include/ixwebsocket>
 )
 
 set_target_properties(ixwebsocket PROPERTIES PUBLIC_HEADER "${IXWEBSOCKET_HEADERS}")
@@ -326,9 +316,4 @@ if (USE_WS OR USE_TEST)
     enable_testing()
     add_subdirectory(test)
   endif()
-endif()
-
-if (BUILD_DEMO) 
-  add_executable(demo main.cpp)
-  target_link_libraries(demo ixwebsocket) 
 endif()

@@ -8,6 +8,7 @@
 
 #include "IXNetSystem.h"
 #include <cstring>
+#include <limits>
 #include <sstream>
 
 namespace ix
@@ -27,10 +28,10 @@ namespace ix
 
     void UdpSocket::close()
     {
-        if (_sockfd == -1) return;
+        int fd = _sockfd.exchange(-1);
+        if (fd == -1) return;
 
-        closeSocket(_sockfd);
-        _sockfd = -1;
+        closeSocket(fd);
     }
 
     int UdpSocket::getErrno()
@@ -69,6 +70,14 @@ namespace ix
 
     bool UdpSocket::init(const std::string& host, int port, std::string& errMsg)
     {
+        close();
+
+        if (port <= 0 || port > 65535)
+        {
+            errMsg = "Invalid UDP target port";
+            return false;
+        }
+
         // DNS resolution with IPv4/IPv6 support
         struct addrinfo hints{}, *result = nullptr;
         hints.ai_family = AF_UNSPEC;
@@ -83,6 +92,13 @@ namespace ix
             return false;
         }
 
+        if (result->ai_addrlen > sizeof(_server))
+        {
+            errMsg = "Resolved UDP address is too large";
+            freeaddrinfo(result);
+            return false;
+        }
+
         _addressFamily = result->ai_family;
         _sockfd = socket(_addressFamily, SOCK_DGRAM, IPPROTO_UDP);
         if (_sockfd < 0)
@@ -94,14 +110,26 @@ namespace ix
 
 #ifdef _WIN32
         unsigned long nonblocking = 1;
-        ioctlsocket(_sockfd, FIONBIO, &nonblocking);
+        if (ioctlsocket(_sockfd, FIONBIO, &nonblocking) != 0)
+        {
+            errMsg = "Could not set UDP socket to non-blocking mode";
+            close();
+            freeaddrinfo(result);
+            return false;
+        }
 #else
-        fcntl(_sockfd, F_SETFL, O_NONBLOCK);
+        if (fcntl(_sockfd, F_SETFL, O_NONBLOCK) == -1)
+        {
+            errMsg = "Could not set UDP socket to non-blocking mode";
+            close();
+            freeaddrinfo(result);
+            return false;
+        }
 #endif
 
         _server = {};
         memcpy(&_server, result->ai_addr, result->ai_addrlen);
-        _serverLen = result->ai_addrlen;
+        _serverLen = static_cast<socklen_t>(result->ai_addrlen);
         freeaddrinfo(result);
 
         return true;
@@ -109,25 +137,45 @@ namespace ix
 
     IoResult UdpSocket::sendto(const std::string& buffer)
     {
+        int fd = _sockfd.load();
+        if (fd == -1) return {0, IoError::ConnectionClosed};
+
+#ifdef _WIN32
+        if (buffer.size() > static_cast<size_t>(std::numeric_limits<int>::max()))
+        {
+            return {0, IoError::Error};
+        }
+        int length = static_cast<int>(buffer.size());
+#else
+        size_t length = buffer.size();
+#endif
+
         auto ret = ::sendto(
-            _sockfd, buffer.data(), buffer.size(), 0, (struct sockaddr*) &_server, _serverLen);
-        if (ret > 0) return {static_cast<size_t>(ret), IoError::Success};
-        if (ret == 0) return {0, IoError::ConnectionClosed};
+            fd, buffer.data(), length, 0, (struct sockaddr*) &_server, _serverLen);
+        if (ret >= 0) return {static_cast<size_t>(ret), IoError::Success};
         if (isWaitNeeded()) return {0, IoError::WouldBlock};
         return {0, IoError::Error};
     }
 
     IoResult UdpSocket::recvfrom(char* buffer, size_t length)
     {
+        int fd = _sockfd.load();
+        if (fd == -1) return {0, IoError::ConnectionClosed};
+
 #ifdef _WIN32
-        int addressLen = (int) _serverLen;
+        if (length > static_cast<size_t>(std::numeric_limits<int>::max()))
+        {
+            return {0, IoError::Error};
+        }
+        int receiveLength = static_cast<int>(length);
+        int addressLen = static_cast<int>(_serverLen);
 #else
+        size_t receiveLength = length;
         socklen_t addressLen = _serverLen;
 #endif
         auto ret = ::recvfrom(
-            _sockfd, buffer, length, 0, (struct sockaddr*) &_server, &addressLen);
-        if (ret > 0) return {static_cast<size_t>(ret), IoError::Success};
-        if (ret == 0) return {0, IoError::ConnectionClosed};
+            fd, buffer, receiveLength, 0, (struct sockaddr*) &_server, &addressLen);
+        if (ret >= 0) return {static_cast<size_t>(ret), IoError::Success};
         if (isWaitNeeded()) return {0, IoError::WouldBlock};
         return {0, IoError::Error};
     }

@@ -43,9 +43,9 @@ bool startServer(ix::WebSocketServer& server, std::string& subProtocols)
             {
                 for (auto&& client : server.getClients())
                 {
-                    if (client.get() != &webSocket)
+                    if (client.first.get() != &webSocket)
                     {
-                        client->sendBinary(msg->str);
+                        client.first->sendBinary(msg->str);
                     }
                 }
             }
@@ -105,5 +105,74 @@ TEST_CASE("subprotocol", "[websocket_subprotocol]")
         server.stop();
 
         REQUIRE(subProtocols == "json,msgpack");
+    }
+
+    SECTION("Server subprotocol selection requires exact token match")
+    {
+        int port = getFreePort();
+        ix::WebSocketServer server(port);
+        server.addSubProtocol("json");
+
+        std::string subProtocols;
+        REQUIRE(startServer(server, subProtocols));
+
+        std::atomic<bool> connected(false);
+        std::string selectedProtocol;
+
+        ix::WebSocket webSocket;
+        webSocket.setOnMessageCallback(
+            [&connected, &selectedProtocol](const ix::WebSocketMessagePtr& msg) {
+                if (msg->type == ix::WebSocketMessageType::Open)
+                {
+                    connected = true;
+                    selectedProtocol = msg->openInfo.protocol;
+                }
+            });
+
+        webSocket.addSubProtocol("json-v2");
+
+        std::stringstream ss;
+        ss << "ws://127.0.0.1:" << port;
+        webSocket.setUrl(ss.str());
+        webSocket.start();
+
+        int attempts = 0;
+        while (!connected)
+        {
+            REQUIRE(attempts++ < 300);
+            ix::msleep(10);
+        }
+
+        webSocket.stop();
+        server.stop();
+
+        REQUIRE(subProtocols == "json-v2");
+        REQUIRE(selectedProtocol.empty());
+    }
+
+    SECTION("Client and server ignore invalid configured subprotocol tokens")
+    {
+        int port = getFreePort();
+        ix::WebSocketServer server(port);
+        server.addSubProtocol("bad token");
+
+        std::string subProtocols;
+        REQUIRE(startServer(server, subProtocols));
+
+        ix::WebSocket webSocket;
+        webSocket.setOnMessageCallback([](const ix::WebSocketMessagePtr&) {});
+        webSocket.addSubProtocol("bad token");
+
+        std::stringstream ss;
+        ss << "ws://127.0.0.1:" << port;
+        webSocket.setUrl(ss.str());
+
+        auto result = webSocket.connect(3);
+        webSocket.stop();
+        server.stop();
+
+        REQUIRE(result.success);
+        REQUIRE(subProtocols.empty());
+        REQUIRE(result.protocol.empty());
     }
 }

@@ -10,8 +10,6 @@
 #include <ixwebsocket/IXUrlParser.h>
 #include <string.h>
 
-using namespace ix;
-
 namespace ix
 {
     TEST_CASE("str_case_compare", "[str_case_compare]")

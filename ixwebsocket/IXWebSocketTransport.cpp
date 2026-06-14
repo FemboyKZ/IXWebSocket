@@ -34,22 +34,300 @@
 
 #include "IXWebSocketTransport.h"
 
+#include "IXHttp.h"
+#include "IXSecureRandom.h"
 #include "IXSocketFactory.h"
 #include "IXSocketTLSOptions.h"
+#include "IXStrCaseCompare.h"
 #include "IXUniquePtr.h"
 #include "IXUrlParser.h"
 #include "IXUtf8Validator.h"
 #include "IXWebSocketHandshake.h"
 #include "IXWebSocketHttpHeaders.h"
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
-#include <random>
+#include <limits>
 #include <sstream>
 #include <string.h>
 #include <string>
 #include <thread>
 #include <vector>
 
+namespace
+{
+    constexpr size_t kMaxCloseReasonSize = 123;
+
+    std::string truncateUtf8CloseReason(const std::string& reason)
+    {
+        std::string wireReason = reason;
+        if (wireReason.size() > kMaxCloseReasonSize)
+        {
+            wireReason = wireReason.substr(0, kMaxCloseReasonSize);
+        }
+
+        while (!wireReason.empty() && !ix::validateUtf8(wireReason))
+        {
+            wireReason.pop_back();
+        }
+
+        return wireReason;
+    }
+
+    bool isValidCloseCodeForWire(uint16_t code)
+    {
+        return (code >= 1000 && code <= 1003) || (code >= 1007 && code <= 1014) ||
+               (code >= 3000 && code <= 4999);
+    }
+
+    uint16_t sanitizeCloseCodeForWire(uint16_t code)
+    {
+        if (code == ix::WebSocketCloseConstants::kNoStatusCodeErrorCode)
+        {
+            return code;
+        }
+
+        return isValidCloseCodeForWire(code) ? code : ix::WebSocketCloseConstants::kProtocolErrorCode;
+    }
+
+    int clampInt64ToInt(int64_t value)
+    {
+        if (value > static_cast<int64_t>(std::numeric_limits<int>::max()))
+        {
+            return std::numeric_limits<int>::max();
+        }
+
+        if (value < static_cast<int64_t>(std::numeric_limits<int>::min()))
+        {
+            return std::numeric_limits<int>::min();
+        }
+
+        return static_cast<int>(value);
+    }
+
+    int secondsToMillisecondsClamped(int seconds)
+    {
+        return clampInt64ToInt(static_cast<int64_t>(seconds) * 1000);
+    }
+
+    bool isDefaultWebSocketPort(const std::string& protocol, int port)
+    {
+        return (protocol == "ws" && port == 80) || (protocol == "wss" && port == 443);
+    }
+
+    bool isSensitiveRedirectHeader(std::string_view name)
+    {
+        return ix::caseInsensitiveEquals(name, "authorization") ||
+               ix::caseInsensitiveEquals(name, "proxy-authorization") ||
+               ix::caseInsensitiveEquals(name, "cookie") ||
+               ix::caseInsensitiveEquals(name, "cookie2") ||
+               ix::caseInsensitiveEquals(name, "host");
+    }
+
+    void removeSensitiveRedirectHeaders(ix::WebSocketHttpHeaders& headers)
+    {
+        for (auto it = headers.begin(); it != headers.end();)
+        {
+            if (isSensitiveRedirectHeader(it->first))
+            {
+                it = headers.erase(it);
+            }
+            else
+            {
+                ++it;
+            }
+        }
+    }
+
+    bool shouldForwardSensitiveHeaders(const std::string& fromUrl, const std::string& toUrl)
+    {
+        std::string fromProtocol;
+        std::string fromHost;
+        std::string fromPath;
+        std::string fromQuery;
+        int fromPort = 0;
+
+        std::string toProtocol;
+        std::string toHost;
+        std::string toPath;
+        std::string toQuery;
+        int toPort = 0;
+
+        if (!ix::UrlParser::parse(fromUrl, fromProtocol, fromHost, fromPath, fromQuery, fromPort) ||
+            !ix::UrlParser::parse(toUrl, toProtocol, toHost, toPath, toQuery, toPort))
+        {
+            return false;
+        }
+
+        return ix::caseInsensitiveEquals(fromProtocol, toProtocol) &&
+               ix::caseInsensitiveEquals(fromHost, toHost) && fromPort == toPort;
+    }
+
+    void splitPathAndQuery(const std::string& value, std::string& path, std::string& query)
+    {
+        std::string withoutFragment = value.substr(0, value.find('#'));
+        auto queryPos = withoutFragment.find('?');
+
+        if (queryPos == std::string::npos)
+        {
+            path = withoutFragment;
+            query.clear();
+            return;
+        }
+
+        path = withoutFragment.substr(0, queryPos);
+        query = withoutFragment.substr(queryPos + 1);
+    }
+
+    std::string normalizeUrlPath(const std::string& path)
+    {
+        std::vector<std::string> segments;
+
+        size_t start = 0;
+        while (start <= path.size())
+        {
+            size_t slashPos = path.find('/', start);
+            size_t end = (slashPos == std::string::npos) ? path.size() : slashPos;
+
+            std::string segment = path.substr(start, end - start);
+            if (segment == "..")
+            {
+                if (!segments.empty())
+                {
+                    segments.pop_back();
+                }
+            }
+            else if (!segment.empty() && segment != ".")
+            {
+                segments.emplace_back(segment);
+            }
+
+            if (slashPos == std::string::npos)
+            {
+                break;
+            }
+
+            start = slashPos + 1;
+        }
+
+        std::string normalizedPath("/");
+        for (size_t i = 0; i < segments.size(); ++i)
+        {
+            normalizedPath += segments[i];
+            if (i + 1 != segments.size())
+            {
+                normalizedPath += '/';
+            }
+        }
+
+        if (path.size() > 1 && path.back() == '/' && normalizedPath.back() != '/')
+        {
+            normalizedPath += '/';
+        }
+
+        return normalizedPath;
+    }
+
+    bool resolveRedirectUrl(const std::string& baseUrl,
+                            const std::string& location,
+                            std::string& resolvedUrl,
+                            std::string& errorMsg)
+    {
+        if (location.empty())
+        {
+            errorMsg = "Redirect Location header is empty";
+            return false;
+        }
+
+        if (ix::caseInsensitiveStartsWith(location, "ws://") ||
+            ix::caseInsensitiveStartsWith(location, "wss://"))
+        {
+            resolvedUrl = location;
+            return true;
+        }
+
+        if (ix::caseInsensitiveStartsWith(location, "http://"))
+        {
+            resolvedUrl = "ws://" + location.substr(7);
+            return true;
+        }
+
+        if (ix::caseInsensitiveStartsWith(location, "https://"))
+        {
+            resolvedUrl = "wss://" + location.substr(8);
+            return true;
+        }
+
+        std::string protocol;
+        std::string host;
+        std::string path;
+        std::string query;
+        int port = 0;
+        if (!ix::UrlParser::parse(baseUrl, protocol, host, path, query, port))
+        {
+            errorMsg = "Could not parse redirect base url: " + baseUrl;
+            return false;
+        }
+
+        std::string basePathOnly;
+        std::string ignoredBaseQuery;
+        splitPathAndQuery(path, basePathOnly, ignoredBaseQuery);
+        if (basePathOnly.empty())
+        {
+            basePathOnly = "/";
+        }
+
+        if (location.rfind("//", 0) == 0)
+        {
+            resolvedUrl = protocol + ":" + location;
+            return true;
+        }
+
+        std::string resolvedPath;
+        std::string resolvedQuery;
+
+        if (location[0] == '/')
+        {
+            splitPathAndQuery(location, resolvedPath, resolvedQuery);
+        }
+        else if (location[0] == '?')
+        {
+            resolvedPath = basePathOnly;
+            resolvedQuery = location.substr(1);
+        }
+        else if (location[0] == '#')
+        {
+            resolvedPath = basePathOnly;
+            resolvedQuery = query;
+        }
+        else
+        {
+            std::string basePath = basePathOnly;
+            auto slashPos = basePath.rfind('/');
+            std::string directory = (slashPos == std::string::npos) ? "/" : basePath.substr(0, slashPos + 1);
+
+            std::string merged = directory + location;
+            splitPathAndQuery(merged, resolvedPath, resolvedQuery);
+        }
+
+        resolvedPath = normalizeUrlPath(resolvedPath.empty() ? "/" : resolvedPath);
+
+        std::stringstream ss;
+        ss << protocol << "://" << ix::formatHttpHost(host);
+        if (!isDefaultWebSocketPort(protocol, port))
+        {
+            ss << ":" << port;
+        }
+        ss << resolvedPath;
+        if (!resolvedQuery.empty())
+        {
+            ss << "?" << resolvedQuery;
+        }
+
+        resolvedUrl = ss.str();
+        return true;
+    }
+} // namespace
 
 namespace ix
 {
@@ -109,11 +387,11 @@ namespace ix
         _socketTLSOptions = socketTLSOptions;
         _proxyConfig = proxyConfig;
         _enablePong = enablePong;
-        _pingIntervalSecs = pingIntervalSecs;
-        _pingTimeoutSecs = pingTimeoutSecs;
-        _idleTimeoutSecs = idleTimeoutSecs;
-        _sendTimeoutSecs = sendTimeoutSecs;
-        _closeTimeoutMs = closeTimeoutSecs * 1000;
+        _pingIntervalSecs.store(pingIntervalSecs);
+        _pingTimeoutSecs.store(pingTimeoutSecs);
+        _idleTimeoutSecs.store(idleTimeoutSecs);
+        _sendTimeoutSecs.store(sendTimeoutSecs);
+        _closeTimeoutMs.store(secondsToMillisecondsClamped(closeTimeoutSecs));
     }
 
     // Client
@@ -121,11 +399,10 @@ namespace ix
                                                          const WebSocketHttpHeaders& headers,
                                                          int timeoutSecs)
     {
-        std::lock_guard<std::mutex> lock(_socketMutex);
-
         std::string protocol, host, path, query;
         int port;
         std::string remoteUrl(url);
+        WebSocketHttpHeaders currentHeaders(headers);
 
         WebSocketInitResult result;
         const int maxRedirections = 10;
@@ -139,26 +416,33 @@ namespace ix
                 return WebSocketInitResult(false, 0, ss.str());
             }
 
+            if (protocol != "ws" && protocol != "wss")
+            {
+                std::stringstream ss;
+                ss << "Unsupported WebSocket protocol: " << protocol;
+                return WebSocketInitResult(false, 0, ss.str());
+            }
+
             std::string errorMsg;
             bool tls = protocol == "wss";
-            _socket = createSocket(tls, -1, errorMsg, _socketTLSOptions);
-            _perMessageDeflate = ix::make_unique<WebSocketPerMessageDeflate>();
+            auto socket = createSocket(tls, -1, errorMsg, _socketTLSOptions);
+            auto perMessageDeflate = ix::make_unique<WebSocketPerMessageDeflate>();
 
-            if (!_socket)
+            if (!socket)
             {
                 return WebSocketInitResult(false, 0, errorMsg);
             }
 
-            _socket->setProxyConfig(_proxyConfig);
+            socket->setProxyConfig(_proxyConfig);
 
             WebSocketHandshake webSocketHandshake(_requestInitCancellation,
-                                                  _socket,
-                                                  _perMessageDeflate,
+                                                  socket,
+                                                  perMessageDeflate,
                                                   _perMessageDeflateOptions,
                                                   _enablePerMessageDeflate);
 
             result = webSocketHandshake.clientHandshake(
-                remoteUrl, headers, protocol, host, path, port, timeoutSecs);
+                remoteUrl, currentHeaders, protocol, host, path, port, timeoutSecs);
 
             if (result.http_status >= 300 && result.http_status < 400)
             {
@@ -172,12 +456,40 @@ namespace ix
                     break;
                 }
 
-                remoteUrl = it->second;
+                std::string redirectedUrl;
+                if (!resolveRedirectUrl(remoteUrl, it->second, redirectedUrl, result.errorStr))
+                {
+                    result.success = false;
+                    break;
+                }
+
+                if (!shouldForwardSensitiveHeaders(remoteUrl, redirectedUrl))
+                {
+                    removeSensitiveRedirectHeaders(currentHeaders);
+                }
+                remoteUrl = redirectedUrl;
                 continue;
             }
 
             if (result.success)
             {
+                if (_requestInitCancellation)
+                {
+                    socket->close();
+                    return WebSocketInitResult(false, result.http_status, "Connection cancelled");
+                }
+
+                {
+                    std::lock_guard<std::mutex> lock(_socketMutex);
+                    if (_requestInitCancellation)
+                    {
+                        socket->close();
+                        return WebSocketInitResult(false, result.http_status, "Connection cancelled");
+                    }
+                    _socket = std::move(socket);
+                    _perMessageDeflate = std::move(perMessageDeflate);
+                }
+                resetConnectionState();
                 setReadyState(ReadyState::OPEN);
             }
             return result;
@@ -193,18 +505,15 @@ namespace ix
                                                             HttpRequestPtr request,
                                                             const std::vector<std::string>& subProtocols)
     {
-        std::lock_guard<std::mutex> lock(_socketMutex);
-
         // Server should not mask the data it sends to the client
         _useMask = false;
         _blockingSend = true;
 
-        _socket = std::move(socket);
-        _perMessageDeflate = ix::make_unique<WebSocketPerMessageDeflate>();
+        auto perMessageDeflate = ix::make_unique<WebSocketPerMessageDeflate>();
 
         WebSocketHandshake webSocketHandshake(_requestInitCancellation,
-                                              _socket,
-                                              _perMessageDeflate,
+                                              socket,
+                                              perMessageDeflate,
                                               _perMessageDeflateOptions,
                                               _enablePerMessageDeflate);
 
@@ -212,6 +521,23 @@ namespace ix
             webSocketHandshake.serverHandshake(timeoutSecs, enablePerMessageDeflate, request, subProtocols);
         if (result.success)
         {
+            if (_requestInitCancellation)
+            {
+                socket->close();
+                return WebSocketInitResult(false, result.http_status, "Connection cancelled");
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(_socketMutex);
+                if (_requestInitCancellation)
+                {
+                    socket->close();
+                    return WebSocketInitResult(false, result.http_status, "Connection cancelled");
+                }
+                _socket = std::move(socket);
+                _perMessageDeflate = std::move(perMessageDeflate);
+            }
+            resetConnectionState();
             setReadyState(ReadyState::OPEN);
         }
         return result;
@@ -235,6 +561,7 @@ namespace ix
 
         if (readyState == ReadyState::CLOSED)
         {
+            _readyState = readyState;
             if (_onCloseCallback)
             {
                 _onCloseCallback(_closeCode, getCloseReason(), _closeWireSize, _closeRemote);
@@ -250,7 +577,10 @@ namespace ix
             _pongReceived = false;
         }
 
-        _readyState = readyState;
+        if (_readyState != readyState)
+        {
+            _readyState = readyState;
+        }
     }
 
     void WebSocketTransport::setOnCloseCallback(const OnCloseCallback& onCloseCallback)
@@ -268,29 +598,44 @@ namespace ix
     }
 
     // Only consider send PING time points for that computation.
-    bool WebSocketTransport::pingIntervalExceeded()
+    bool WebSocketTransport::pingIntervalExceeded(int pingIntervalSecs)
     {
-        if (_pingIntervalSecs <= 0) return false;
+        if (pingIntervalSecs <= 0) return false;
 
         std::lock_guard<std::mutex> lock(_timePointsMutex);
         auto now = std::chrono::steady_clock::now();
-        return now - _lastSendPingTimePoint > std::chrono::seconds(_pingIntervalSecs);
+        return now - _lastSendPingTimePoint > std::chrono::seconds(pingIntervalSecs);
     }
 
     void WebSocketTransport::setPingMessage(const std::string& message, SendMessageKind pingType)
     {
+        std::lock_guard<std::mutex> lock(_pingConfigMutex);
         _setCustomMessage = true;
         _kPingMessage = message;
         _pingType = pingType;
     }
 
+    SendMessageKind WebSocketTransport::getPingType() const
+    {
+        std::lock_guard<std::mutex> lock(_pingConfigMutex);
+        return _pingType;
+    }
+
     WebSocketSendInfo WebSocketTransport::sendHeartBeat(SendMessageKind pingMessage)
     {
         _pongReceived = false;
-        std::string msg = _kPingMessage;
-        if (!_setCustomMessage)
+        std::string msg;
+        bool setCustomMessage = false;
         {
-            msg += "::" + std::to_string(_pingIntervalSecs) + "s::" + std::to_string(_pingCount++);
+            std::lock_guard<std::mutex> lock(_pingConfigMutex);
+            msg = _kPingMessage;
+            setCustomMessage = _setCustomMessage;
+        }
+
+        if (!setCustomMessage)
+        {
+            msg += "::" + std::to_string(_pingIntervalSecs.load()) + "s::" +
+                   std::to_string(_pingCount++);
         }
         if (pingMessage == SendMessageKind::Ping)
         {
@@ -321,38 +666,45 @@ namespace ix
         return {};
     }
 
-    bool WebSocketTransport::closingDelayExceeded()
+    bool WebSocketTransport::closingDelayExceeded(int closeTimeoutMs)
     {
         std::lock_guard<std::mutex> lock(_closingTimePointMutex);
         auto now = std::chrono::steady_clock::now();
-        return now - _closingTimePoint > std::chrono::milliseconds(_closeTimeoutMs);
+        return now - _closingTimePoint > std::chrono::milliseconds(closeTimeoutMs);
     }
 
     WebSocketTransport::PollResult WebSocketTransport::poll()
     {
+        const int pingIntervalSecs = _pingIntervalSecs.load();
+        const int pingTimeoutSecs = _pingTimeoutSecs.load();
+        const int idleTimeoutSecs = _idleTimeoutSecs.load();
+        const int closeTimeoutMs = _closeTimeoutMs.load();
+
         if (_readyState == ReadyState::OPEN)
         {
+            SendMessageKind pingType = getPingType();
+
             // Check idle timeout and ping timeout
             {
                 std::lock_guard<std::mutex> lock(_timePointsMutex);
                 auto now = std::chrono::steady_clock::now();
 
-                if (_idleTimeoutSecs > 0)
+                if (idleTimeoutSecs > 0)
                 {
                     auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
                         now - _lastActivityTimePoint).count();
-                    if (elapsed >= _idleTimeoutSecs)
+                    if (elapsed >= idleTimeoutSecs)
                     {
                         close(WebSocketCloseConstants::kInternalErrorCode, "Idle timeout");
                     }
                 }
 
                 // Check ping timeout (independent of ping interval)
-                if (_pingTimeoutSecs > 0 && _pingType == SendMessageKind::Ping && !_pongReceived)
+                if (pingTimeoutSecs > 0 && pingType == SendMessageKind::Ping && !_pongReceived)
                 {
                     auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
                         now - _lastPongTimePoint).count();
-                    if (elapsed >= _pingTimeoutSecs)
+                    if (elapsed >= pingTimeoutSecs)
                     {
                         close(WebSocketCloseConstants::kInternalErrorCode,
                               WebSocketCloseConstants::kPingTimeoutMessage);
@@ -360,11 +712,11 @@ namespace ix
                 }
             }
 
-            if (pingIntervalExceeded())
+            if (pingIntervalExceeded(pingIntervalSecs))
             {
                 // If it is not a 'ping' message of ping type, there is no need to judge whether
                 // pong will receive it (legacy behavior when pingTimeoutSecs not set)
-                if (_pingTimeoutSecs <= 0 && _pingType == SendMessageKind::Ping && !_pongReceived)
+                if (pingTimeoutSecs <= 0 && pingType == SendMessageKind::Ping && !_pongReceived)
                 {
                     // ping response (PONG) exceeds the maximum delay, close the connection
                     close(WebSocketCloseConstants::kInternalErrorCode,
@@ -372,30 +724,33 @@ namespace ix
                 }
                 else
                 {
-                    sendHeartBeat(_pingType);
+                    sendHeartBeat(pingType);
                 }
             }
         }
 
         // No timeout if state is not OPEN, otherwise computed
         // pingIntervalOrTimeoutGCD (equals to -1 if no ping and no ping timeout are set)
-        int lastingTimeoutDelayInMs = (_readyState != ReadyState::OPEN) ? 0 : _pingIntervalSecs;
+        int lastingTimeoutDelayInMs = (_readyState != ReadyState::OPEN) ? 0 : pingIntervalSecs;
 
-        if (_pingIntervalSecs > 0)
+        if (pingIntervalSecs > 0)
         {
             // compute lasting delay to wait for next ping / timeout, if at least one set
             std::lock_guard<std::mutex> lock(_timePointsMutex);
             auto now = std::chrono::steady_clock::now();
-            int timeSinceLastPingMs = (int) std::chrono::duration_cast<std::chrono::milliseconds>(
-                                          now - _lastSendPingTimePoint)
-                                          .count();
-            lastingTimeoutDelayInMs = (1000 * _pingIntervalSecs) - timeSinceLastPingMs;
+            auto timeSinceLastPingMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                           now - _lastSendPingTimePoint)
+                .count();
+            int64_t timeoutDelay =
+                static_cast<int64_t>(secondsToMillisecondsClamped(pingIntervalSecs)) -
+                timeSinceLastPingMs;
+            lastingTimeoutDelayInMs = clampInt64ToInt(timeoutDelay);
         }
 
         // The platform may not have select interrupt capabilities, so wait with a small timeout
         // Also need periodic wakeup for idle/ping timeout checks
         if (lastingTimeoutDelayInMs <= 0 &&
-            (!_socket->isWakeUpFromPollSupported() || _idleTimeoutSecs > 0 || _pingTimeoutSecs > 0))
+            (!_socket->isWakeUpFromPollSupported() || idleTimeoutSecs > 0 || pingTimeoutSecs > 0))
         {
             lastingTimeoutDelayInMs = 1000; // 1 second for timeout checks
         }
@@ -435,7 +790,7 @@ namespace ix
             closeSocket();
         }
 
-        if (_readyState == ReadyState::CLOSING && closingDelayExceeded())
+        if (_readyState == ReadyState::CLOSING && closingDelayExceeded(closeTimeoutMs))
         {
             _rxbuf.clear();
             _rxbufOffset = 0;
@@ -473,8 +828,29 @@ namespace ix
         }
     }
 
+    void WebSocketTransport::resetConnectionState()
+    {
+        {
+            std::lock_guard<std::mutex> lock(_txbufMutex);
+            _txbuf.clear();
+            _txbufOffset = 0;
+        }
+
+        _rxbuf.clear();
+        _rxbufOffset = 0;
+        _rxbufWanted = 0;
+
+        _chunks.clear();
+        _chunksSize = 0;
+        _receivedMessageCompressed = false;
+
+        _decompressedMessage.clear();
+        _compressedMessage.clear();
+    }
+
     template<class Iterator>
-    void WebSocketTransport::appendToSendBuffer(const std::vector<uint8_t>& header,
+    bool WebSocketTransport::appendToSendBuffer(const uint8_t* header,
+                                                size_t headerSize,
                                                 Iterator begin,
                                                 Iterator end,
                                                 uint64_t message_size,
@@ -482,8 +858,26 @@ namespace ix
     {
         std::lock_guard<std::mutex> lock(_txbufMutex);
 
-        _txbuf.reserve(_txbuf.size() + header.size() + message_size);
-        _txbuf.insert(_txbuf.end(), header.begin(), header.end());
+        const size_t maxSize = _txbuf.max_size();
+        if (message_size > static_cast<uint64_t>(maxSize) || headerSize > maxSize - _txbuf.size())
+        {
+            return false;
+        }
+
+        const size_t payloadSize = static_cast<size_t>(message_size);
+        const size_t headerEndSize = _txbuf.size() + headerSize;
+        if (payloadSize > maxSize - headerEndSize)
+        {
+            return false;
+        }
+
+        const size_t requiredSize = headerEndSize + payloadSize;
+        if (_txbuf.capacity() < requiredSize)
+        {
+            _txbuf.reserve(requiredSize);
+        }
+
+        _txbuf.insert(_txbuf.end(), header, header + headerSize);
 
         if (_useMask)
         {
@@ -491,14 +885,14 @@ namespace ix
             _txbuf.insert(_txbuf.end(), begin, end);
             uint8_t* data = _txbuf.data() + startPos;
             size_t i = 0;
-            for (; i + 4 <= message_size; i += 4)
+            for (; i < payloadSize && payloadSize - i >= 4; i += 4)
             {
                 data[i]     ^= masking_key[0];
                 data[i + 1] ^= masking_key[1];
                 data[i + 2] ^= masking_key[2];
                 data[i + 3] ^= masking_key[3];
             }
-            for (; i < message_size; ++i)
+            for (; i < payloadSize; ++i)
             {
                 data[i] ^= masking_key[i & 0x3];
             }
@@ -507,6 +901,8 @@ namespace ix
         {
             _txbuf.insert(_txbuf.end(), begin, end);
         }
+
+        return true;
     }
 
     void WebSocketTransport::unmaskReceiveBuffer(const wsheader_type& ws)
@@ -515,14 +911,15 @@ namespace ix
         {
             uint8_t* data = _rxbuf.data() + _rxbufOffset + ws.header_size;
             size_t j = 0;
-            for (; j + 4 <= ws.N; j += 4)
+            const size_t payloadSize = static_cast<size_t>(ws.N);
+            for (; j < payloadSize && payloadSize - j >= 4; j += 4)
             {
                 data[j]     ^= ws.masking_key[0];
                 data[j + 1] ^= ws.masking_key[1];
                 data[j + 2] ^= ws.masking_key[2];
                 data[j + 3] ^= ws.masking_key[3];
             }
-            for (; j < ws.N; ++j)
+            for (; j < payloadSize; ++j)
             {
                 data[j] ^= ws.masking_key[j & 0x3];
             }
@@ -554,6 +951,9 @@ namespace ix
     void WebSocketTransport::dispatch(WebSocketTransport::PollResult pollResult,
                                       const OnMessageCallback& onMessageCallback)
     {
+        std::string payloadScratch;
+        std::string mergedMessage;
+
         while (true)
         {
             wsheader_type ws;
@@ -620,6 +1020,43 @@ namespace ix
                 return;
             }
 
+            if ((ws.N0 == 126 && ws.N < 126) ||
+                (ws.N0 == 127 && ((data[2] & 0x80) == 0x80 || ws.N < 65536)))
+            {
+                close(WebSocketCloseConstants::kProtocolErrorCode,
+                      WebSocketCloseConstants::kProtocolErrorMessage,
+                      avail);
+                return;
+            }
+
+            bool isControlFrame = ws.opcode == wsheader_type::PING ||
+                                  ws.opcode == wsheader_type::PONG ||
+                                  ws.opcode == wsheader_type::CLOSE;
+            if ((isControlFrame || ws.opcode == wsheader_type::CONTINUATION) && ws.rsv1)
+            {
+                close(WebSocketCloseConstants::kProtocolErrorCode,
+                      WebSocketCloseConstants::kProtocolErrorReservedBitUsed,
+                      avail);
+                return;
+            }
+
+            if (isControlFrame && ws.N > 125)
+            {
+                close(WebSocketCloseConstants::kProtocolErrorCode,
+                      WebSocketCloseConstants::kProtocolErrorMessage,
+                      avail);
+                return;
+            }
+
+            // client frames MUST be masked and server frames MUST NOT be masked.
+            if (ws.mask == _useMask)
+            {
+                close(WebSocketCloseConstants::kProtocolErrorCode,
+                      WebSocketCloseConstants::kProtocolErrorMessage,
+                      avail);
+                return;
+            }
+
             if (ws.mask)
             {
                 ws.masking_key[0] = ((uint8_t) data[i + 0]) << 0;
@@ -635,16 +1072,19 @@ namespace ix
                 ws.masking_key[3] = 0;
             }
 
-            // Prevent integer overflow in the next conditional
-            const uint64_t maxFrameSize(1ULL << 63);
-            if (ws.N > maxFrameSize)
+            if (ws.N > kMaxFramePayloadSize ||
+                ws.N > static_cast<uint64_t>(std::numeric_limits<size_t>::max()))
             {
+                close(WebSocketCloseConstants::kMessageTooBigCode,
+                      WebSocketCloseConstants::kMessageTooBigMessage,
+                      avail);
                 return;
             }
 
-            if (avail < ws.header_size + ws.N)
+            const uint64_t wantedSize = static_cast<uint64_t>(ws.header_size) + ws.N;
+            if (avail < wantedSize)
             {
-                _rxbufWanted = ws.header_size + ws.N;
+                _rxbufWanted = wantedSize;
                 return; /* Need: ws.header_size+ws.N - avail */
             }
 
@@ -660,10 +1100,9 @@ namespace ix
             }
 
             unmaskReceiveBuffer(ws);
-            std::string frameData;
-            frameData.reserve((size_t) ws.N);
-            frameData.assign(_rxbuf.begin() + _rxbufOffset + ws.header_size,
-                             _rxbuf.begin() + _rxbufOffset + ws.header_size + (size_t) ws.N);
+            const char* payloadData =
+                reinterpret_cast<const char*>(_rxbuf.data() + _rxbufOffset + ws.header_size);
+            const size_t payloadSize = static_cast<size_t>(ws.N);
 
             // We got a whole message, now do something with it:
             if (ws.opcode == wsheader_type::TEXT_FRAME ||
@@ -683,6 +1122,7 @@ namespace ix
                     {
                         close(WebSocketCloseConstants::kProtocolErrorCode,
                               WebSocketCloseConstants::kProtocolErrorCodeDataOpcodeOutOfSequence);
+                        return;
                     }
                 }
                 else if (_chunks.empty())
@@ -691,6 +1131,7 @@ namespace ix
                     close(
                         WebSocketCloseConstants::kProtocolErrorCode,
                         WebSocketCloseConstants::kProtocolErrorCodeContinuationOpCodeOutOfSequence);
+                    return;
                 }
 
                 //
@@ -698,12 +1139,17 @@ namespace ix
                 //
                 if (ws.fin && _chunks.empty())
                 {
-                    emitMessage(_fragmentedMessageKind,
-                                frameData,
-                                _receivedMessageCompressed,
-                                onMessageCallback);
+                    payloadScratch.assign(payloadData, payloadSize);
+                    bool emitted = emitMessage(_fragmentedMessageKind,
+                                               payloadScratch,
+                                               _receivedMessageCompressed,
+                                               onMessageCallback);
 
                     _receivedMessageCompressed = false;
+                    if (!emitted)
+                    {
+                        return;
+                    }
                 }
                 else
                 {
@@ -714,45 +1160,58 @@ namespace ix
                     // the internal buffer which is slow and can let the internal OS
                     // receive buffer fill out.
                     //
-                    _chunksSize += frameData.size();
-                    _chunks.emplace_back(frameData);
+                    if (payloadSize > kMaxFragmentedMessageSize ||
+                        _chunksSize > kMaxFragmentedMessageSize - payloadSize)
+                    {
+                        close(WebSocketCloseConstants::kProtocolErrorCode,
+                              WebSocketCloseConstants::kProtocolErrorMessage,
+                              avail);
+                        return;
+                    }
+
+                    _chunksSize += payloadSize;
+                    _chunks.emplace_back(payloadData, payloadSize);
 
                     if (ws.fin)
                     {
-                        emitMessage(_fragmentedMessageKind,
-                                    getMergedChunks(),
-                                    _receivedMessageCompressed,
-                                    onMessageCallback);
+                        getMergedChunks(mergedMessage);
+                        bool emitted = emitMessage(_fragmentedMessageKind,
+                                                   mergedMessage,
+                                                   _receivedMessageCompressed,
+                                                   onMessageCallback);
 
                         _chunks.clear();
                         _chunksSize = 0;
                         _receivedMessageCompressed = false;
+                        if (!emitted)
+                        {
+                            return;
+                        }
                     }
                     else
                     {
-                        emitMessage(MessageKind::FRAGMENT, std::string(), false, onMessageCallback);
+                        if (!emitMessage(MessageKind::FRAGMENT, std::string(), false, onMessageCallback))
+                        {
+                            return;
+                        }
                     }
                 }
             }
             else if (ws.opcode == wsheader_type::PING)
             {
-                // too large
-                if (frameData.size() > 125)
-                {
-                    // Unexpected frame type
-                    close(WebSocketCloseConstants::kProtocolErrorCode,
-                          WebSocketCloseConstants::kProtocolErrorPingPayloadOversized);
-                    return;
-                }
-
                 if (_enablePong)
                 {
                     // Reply back right away
                     bool compress = false;
-                    sendData(wsheader_type::PONG, frameData, compress);
+                    IXWebSocketSendData pongPayload(payloadData, payloadSize);
+                    sendData(wsheader_type::PONG, pongPayload, compress);
                 }
 
-                emitMessage(MessageKind::PING, frameData, false, onMessageCallback);
+                payloadScratch.assign(payloadData, payloadSize);
+                if (!emitMessage(MessageKind::PING, payloadScratch, false, onMessageCallback))
+                {
+                    return;
+                }
             }
             else if (ws.opcode == wsheader_type::PONG)
             {
@@ -761,23 +1220,34 @@ namespace ix
                     std::lock_guard<std::mutex> lock(_timePointsMutex);
                     _lastPongTimePoint = std::chrono::steady_clock::now();
                 }
-                emitMessage(MessageKind::PONG, frameData, false, onMessageCallback);
+                payloadScratch.assign(payloadData, payloadSize);
+                if (!emitMessage(MessageKind::PONG, payloadScratch, false, onMessageCallback))
+                {
+                    return;
+                }
             }
             else if (ws.opcode == wsheader_type::CLOSE)
             {
                 std::string reason;
                 uint16_t code = 0;
 
-                if (ws.N >= 2)
+                if (ws.N == 1)
                 {
+                    code = WebSocketCloseConstants::kProtocolErrorCode;
+                    reason = WebSocketCloseConstants::kProtocolErrorMessage;
+                }
+                else if (ws.N >= 2)
+                {
+                    const auto* payloadBytes = reinterpret_cast<const uint8_t*>(payloadData);
+
                     // Extract the close code first, available as the first 2 bytes
-                    code |= ((uint64_t) _rxbuf[_rxbufOffset + ws.header_size]) << 8;
-                    code |= ((uint64_t) _rxbuf[_rxbufOffset + ws.header_size + 1]) << 0;
+                    code = static_cast<uint16_t>((static_cast<uint16_t>(payloadBytes[0]) << 8) |
+                                                 static_cast<uint16_t>(payloadBytes[1]));
 
                     // Get the reason.
-                    if (ws.N > 2)
+                    if (payloadSize > 2)
                     {
-                        reason = frameData.substr(2, frameData.size());
+                        reason.assign(payloadData + 2, payloadSize - 2);
                     }
 
                     // Validate that the reason is proper utf-8. Autobahn 7.5.1
@@ -788,13 +1258,10 @@ namespace ix
                     }
 
                     //
-                    // Validate close codes per RFC 6455 Section 7.4.1
-                    // Valid ranges: 1000-1003, 1007-1011, 3000-4999
-                    // Reserved (invalid on wire): 1004, 1005, 1006
-                    // Non-standard but accepted: 1012-1015 (used by some implementations)
+                    // Validate close codes per RFC 6455 Section 7.4.1.
+                    // 1005, 1006, and 1015 are reserved and must not appear on the wire.
                     //
-                    if (code < 1000 || code == 1004 || code == 1005 || code == 1006 ||
-                        (code > 1015 && code < 3000) || code > 4999)
+                    if (!isValidCloseCodeForWire(code))
                     {
                         // build up an error message containing the bad error code
                         std::stringstream ss;
@@ -835,6 +1302,8 @@ namespace ix
                         closeSocketAndSwitchToClosedState(code, reason, avail, remote);
                     }
                 }
+
+                return;
             }
             else
             {
@@ -842,6 +1311,7 @@ namespace ix
                 close(WebSocketCloseConstants::kProtocolErrorCode,
                       WebSocketCloseConstants::kProtocolErrorMessage,
                       avail);
+                return;
             }
 
             // Advance offset past the processed message
@@ -875,18 +1345,17 @@ namespace ix
         }
     }
 
-    std::string WebSocketTransport::getMergedChunks() const
+    void WebSocketTransport::getMergedChunks(std::string& message) const
     {
-        std::string msg;
-        msg.reserve(_chunksSize);
+        message.clear();
+        message.reserve(_chunksSize);
         for (const auto& chunk : _chunks)
         {
-            msg.append(chunk);
+            message.append(chunk);
         }
-        return msg;
     }
 
-    void WebSocketTransport::emitMessage(MessageKind messageKind,
+    bool WebSocketTransport::emitMessage(MessageKind messageKind,
                                          const std::string& message,
                                          bool compressedMessage,
                                          const OnMessageCallback& onMessageCallback)
@@ -901,16 +1370,22 @@ namespace ix
         if (compressedMessage && messageKind != MessageKind::FRAGMENT)
         {
             bool success = _perMessageDeflate->decompress(message, _decompressedMessage);
+            if (!success)
+            {
+                close(WebSocketCloseConstants::kInvalidFramePayloadData,
+                      WebSocketCloseConstants::kInvalidFramePayloadDataMessage);
+                return false;
+            }
 
             if (messageKind == MessageKind::MSG_TEXT && !validateUtf8(_decompressedMessage))
             {
                 close(WebSocketCloseConstants::kInvalidFramePayloadData,
                       WebSocketCloseConstants::kInvalidFramePayloadDataMessage);
+                return false;
             }
-            else
-            {
-                onMessageCallback(_decompressedMessage, wireSize, !success, messageKind);
-            }
+
+            onMessageCallback(_decompressedMessage, wireSize, false, messageKind);
+            return true;
         }
         else
         {
@@ -918,18 +1393,12 @@ namespace ix
             {
                 close(WebSocketCloseConstants::kInvalidFramePayloadData,
                       WebSocketCloseConstants::kInvalidFramePayloadDataMessage);
+                return false;
             }
-            else
-            {
-                onMessageCallback(message, wireSize, false, messageKind);
-            }
-        }
-    }
 
-    unsigned WebSocketTransport::getRandomUnsigned()
-    {
-        static thread_local std::mt19937 gen(std::random_device{}());
-        return gen();
+            onMessageCallback(message, wireSize, false, messageKind);
+            return true;
+        }
     }
 
     WebSocketSendInfo WebSocketTransport::sendData(wsheader_type::opcode_type type,
@@ -937,6 +1406,15 @@ namespace ix
                                                    bool compress,
                                                    const OnProgressCallback& onProgressCallback)
     {
+        std::lock_guard<std::recursive_mutex> lock(_sendDataMutex);
+
+        bool isControlFrame = type == wsheader_type::PING || type == wsheader_type::PONG ||
+                              type == wsheader_type::CLOSE;
+        if (isControlFrame && message.size() > 125)
+        {
+            return WebSocketSendInfo(false);
+        }
+
         if (_readyState != ReadyState::OPEN && _readyState != ReadyState::CLOSING)
         {
             return WebSocketSendInfo(false);
@@ -967,21 +1445,17 @@ namespace ix
             message_end = compressedSendData.cend();
         }
 
-        {
-            std::lock_guard<std::mutex> lock(_txbufMutex);
-            _txbuf.reserve(wireSize);
-        }
-
         bool success = true;
 
         // Common case for most message. No fragmentation required.
         if (wireSize < kChunkSize)
         {
-            success = sendFragment(type, true, message_begin, message_end, compress);
+            success = sendFragment(type, true, message_begin, message_end, wireSize, compress);
 
-            if (onProgressCallback)
+            if (success && onProgressCallback && !onProgressCallback(1, 1))
             {
-                onProgressCallback(0, 1);
+                close(WebSocketCloseConstants::kInternalErrorCode, "Send cancelled");
+                return WebSocketSendInfo(false, compressionError, payloadSize, wireSize);
             }
         }
         else
@@ -994,7 +1468,7 @@ namespace ix
             // Intermediary and last messages need to be of type CONTINUATION
             // Last message must set the fin byte.
             //
-            auto steps = wireSize / kChunkSize;
+            auto steps = wireSize / kChunkSize + (wireSize % kChunkSize == 0 ? 0 : 1);
 
             auto begin = message_begin;
             auto end = message_end;
@@ -1005,11 +1479,7 @@ namespace ix
                 bool lastStep = (i + 1) == steps;
                 bool fin = lastStep;
 
-                end = begin + kChunkSize;
-                if (lastStep)
-                {
-                    end = message_end;
-                }
+                end = lastStep ? message_end : begin + kChunkSize;
 
                 auto opcodeType = type;
                 if (!firstStep)
@@ -1018,17 +1488,19 @@ namespace ix
                 }
 
                 // Send message
-                if (!sendFragment(opcodeType, fin, begin, end, compress))
+                const uint64_t fragmentSize = static_cast<uint64_t>(end - begin);
+                if (!sendFragment(opcodeType, fin, begin, end, fragmentSize, compress))
                 {
                     return WebSocketSendInfo(false);
                 }
 
-                if (onProgressCallback && !onProgressCallback((int) i, (int) steps))
+                if (onProgressCallback && !onProgressCallback(i + 1, steps))
                 {
-                    break;
+                    close(WebSocketCloseConstants::kInternalErrorCode, "Send cancelled");
+                    return WebSocketSendInfo(false, compressionError, payloadSize, wireSize);
                 }
 
-                begin += kChunkSize;
+                begin = end;
             }
         }
 
@@ -1051,16 +1523,14 @@ namespace ix
                                           bool fin,
                                           Iterator message_begin,
                                           Iterator message_end,
+                                          uint64_t message_size,
                                           bool compress)
     {
-        uint64_t message_size = static_cast<uint64_t>(message_end - message_begin);
-
-        unsigned x = getRandomUnsigned();
         uint8_t masking_key[4] = {};
-        masking_key[0] = (x >> 24);
-        masking_key[1] = (x >> 16) & 0xff;
-        masking_key[2] = (x >> 8) & 0xff;
-        masking_key[3] = (x) &0xff;
+        if (_useMask && !secureRandomBytes(masking_key, sizeof(masking_key)))
+        {
+            return false;
+        }
 
         // Max header size: 2 + 8 (extended length) + 4 (mask) = 14 bytes
         uint8_t headerBuf[14] = {};
@@ -1129,8 +1599,11 @@ namespace ix
         }
 
         // _txbuf will keep growing until it can be transmitted over the socket:
-        std::vector<uint8_t> header(headerBuf, headerBuf + headerSize);
-        appendToSendBuffer(header, message_begin, message_end, message_size, masking_key);
+        if (!appendToSendBuffer(
+                headerBuf, headerSize, message_begin, message_end, message_size, masking_key))
+        {
+            return false;
+        }
 
         // Now actually send this data
         return sendOnSocket();
@@ -1246,6 +1719,7 @@ namespace ix
     void WebSocketTransport::sendCloseFrame(uint16_t code, const std::string& reason)
     {
         bool compress = false;
+        code = sanitizeCloseCodeForWire(code);
 
         // if a status is set/was read
         if (code != WebSocketCloseConstants::kNoStatusCodeErrorCode)
@@ -1299,6 +1773,8 @@ namespace ix
                                    size_t closeWireSize,
                                    bool remote)
     {
+        std::lock_guard<std::mutex> lock(_closeMutex);
+
         _requestInitCancellation = true;
 
         if (_readyState == ReadyState::CLOSING || _readyState == ReadyState::CLOSED)
@@ -1318,13 +1794,22 @@ namespace ix
             return;
         }
 
+        std::string wireReason = truncateUtf8CloseReason(reason);
+        uint16_t wireCode = sanitizeCloseCodeForWire(code);
+
         if (closeWireSize == 0)
         {
-            closeWireSize = reason.size();
+            closeWireSize = wireReason.size();
         }
 
-        setCloseReason(reason);
-        _closeCode = code;
+        if (wireCode == WebSocketCloseConstants::kNoStatusCodeErrorCode)
+        {
+            wireReason = WebSocketCloseConstants::kNoStatusCodeErrorMessage;
+            closeWireSize = 0;
+        }
+
+        setCloseReason(wireReason);
+        _closeCode = wireCode;
         _closeWireSize = closeWireSize;
         _closeRemote = remote;
 
@@ -1334,7 +1819,7 @@ namespace ix
         }
         setReadyState(ReadyState::CLOSING);
 
-        sendCloseFrame(code, reason);
+        sendCloseFrame(wireCode, wireReason);
 
         // wake up the poll, but do not close yet
         wakeUpFromPoll(SelectInterrupt::kSendRequest);
@@ -1349,12 +1834,13 @@ namespace ix
     bool WebSocketTransport::flushSendBuffer()
     {
         auto start = std::chrono::steady_clock::now();
+        const int sendTimeoutSecs = _sendTimeoutSecs.load();
 
         while (!isSendBufferEmpty() && !_requestInitCancellation)
         {
             auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
                 std::chrono::steady_clock::now() - start).count();
-            if (elapsed >= _sendTimeoutSecs)
+            if (elapsed >= sendTimeoutSecs)
             {
                 return false;
             }
@@ -1387,7 +1873,7 @@ namespace ix
         _closeReason = reason;
     }
 
-    const std::string& WebSocketTransport::getCloseReason() const
+    std::string WebSocketTransport::getCloseReason() const
     {
         std::lock_guard<std::mutex> lock(_closeReasonMutex);
         return _closeReason;

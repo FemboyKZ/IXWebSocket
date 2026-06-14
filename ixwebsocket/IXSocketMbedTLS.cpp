@@ -12,11 +12,16 @@
 #include "IXSocketMbedTLS.h"
 
 #include "IXNetSystem.h"
-#include "IXProxyConnect.h"
 #include "IXSocket.h"
-#include "IXSocketConnect.h"
+#include <algorithm>
 #include <cstdint>
+#include <fstream>
+#include <limits>
 #include <string.h>
+#ifdef IXWEBSOCKET_USE_MBED_TLS_MIN_VERSION_3
+#include <psa/crypto.h>
+#include <psa/crypto_extra.h>
+#endif
 
 #ifdef _WIN32
 // For manipulating the certificate store
@@ -25,6 +30,79 @@
 
 namespace ix
 {
+    namespace
+    {
+#ifndef _WIN32
+        bool loadCertificateBundleFromFiles(mbedtls_x509_crt* cert,
+                                            const char* const* paths,
+                                            size_t pathCount,
+                                            std::string& errorMsg)
+        {
+            bool foundBundle = false;
+            std::string parseErrors;
+
+            for (size_t i = 0; i < pathCount; ++i)
+            {
+                const char* path = paths[i];
+                std::ifstream file(path);
+                if (!file.good())
+                {
+                    continue;
+                }
+
+                foundBundle = true;
+                int ret = mbedtls_x509_crt_parse_file(cert, path);
+                if (ret == 0)
+                {
+                    return true;
+                }
+
+                char buf[256];
+                mbedtls_strerror(ret, buf, sizeof(buf));
+                parseErrors += path;
+                parseErrors += ": ";
+                parseErrors += buf;
+                parseErrors += "; ";
+            }
+
+            errorMsg = foundBundle ? "Cannot parse system CA bundle: " + parseErrors
+                                   : "No supported system CA bundle found";
+            return false;
+        }
+#endif
+
+        constexpr int kTlsHandshakePollTimeoutMs = 100;
+
+        bool waitForMbedTlsIo(Socket& socket,
+                              int result,
+                              const CancellationRequest& isCancellationRequested,
+                              std::string& errMsg)
+        {
+            if (isCancellationRequested && isCancellationRequested())
+            {
+                errMsg = "Cancellation requested";
+                return false;
+            }
+
+            PollResultType pollResult = result == MBEDTLS_ERR_SSL_WANT_READ
+                                            ? socket.isReadyToRead(kTlsHandshakePollTimeoutMs)
+                                            : socket.isReadyToWrite(kTlsHandshakePollTimeoutMs);
+            if (pollResult == PollResultType::Error)
+            {
+                errMsg = "TLS handshake socket wait failed";
+                return false;
+            }
+
+            if (isCancellationRequested && isCancellationRequested())
+            {
+                errMsg = "Cancellation requested";
+                return false;
+            }
+
+            return true;
+        }
+    }
+
     SocketMbedTLS::SocketMbedTLS(const SocketTLSOptions& tlsOptions, int fd)
         : Socket(fd)
         , _tlsOptions(tlsOptions)
@@ -41,6 +119,7 @@ namespace ix
     {
         std::lock_guard<std::mutex> lock(_mutex);
 
+        _tlsReady = false;
         mbedtls_ssl_init(&_ssl);
         mbedtls_ssl_config_init(&_conf);
         mbedtls_ctr_drbg_init(&_ctr_drbg);
@@ -48,13 +127,11 @@ namespace ix
         mbedtls_x509_crt_init(&_cacert);
         mbedtls_x509_crt_init(&_cert);
         mbedtls_pk_init(&_pkey);
-        // Initialize the PSA Crypto API if required by the version of Mbed TLS (3.6.0).
-        // This allows the X.509/TLS libraries to use PSA for crypto operations.
+        // Initialize PSA when building with Mbed TLS v3.
         // See: https://github.com/Mbed-TLS/mbedtls/blob/development/docs/use-psa-crypto.md
-        if (MBEDTLS_VERSION_MAJOR >= 3 && MBEDTLS_VERSION_MINOR >= 6 && MBEDTLS_VERSION_PATCH >= 0)
-        {
-            psa_crypto_init();
-        }
+#ifdef IXWEBSOCKET_USE_MBED_TLS_MIN_VERSION_3
+        (void) psa_crypto_init();
+#endif
     }
 
     bool SocketMbedTLS::loadSystemCertificates(std::string& errorMsg)
@@ -99,11 +176,134 @@ namespace ix
 
         return true;
 #else
-        // On macOS we can query the system cert location from the keychain
-        // On Linux we could try to fetch some local files based on the distribution
-        // On Android we could use JNI to get to the system certs
-        return false;
+    #if defined(__APPLE__)
+        const char* const caFiles[] = {
+            "/etc/ssl/cert.pem",
+            "/usr/local/etc/openssl/cert.pem",
+            "/opt/homebrew/etc/openssl/cert.pem",
+            "/opt/homebrew/etc/openssl@3/cert.pem",
+        };
+    #else
+        const char* const caFiles[] = {
+            "/etc/ssl/certs/ca-certificates.crt",
+            "/etc/pki/tls/certs/ca-bundle.crt",
+            "/etc/ssl/ca-bundle.pem",
+            "/etc/pki/tls/cacert.pem",
+            "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+            "/etc/ssl/cert.pem",
+        };
+    #endif
+        return loadCertificateBundleFromFiles(
+            &_cacert, caFiles, sizeof(caFiles) / sizeof(caFiles[0]), errorMsg);
 #endif
+    }
+
+    int SocketMbedTLS::sendFromSocket(void* ctx, const unsigned char* buf, size_t len)
+    {
+        auto* socket = static_cast<Socket*>(ctx);
+        if (socket == nullptr)
+        {
+            return MBEDTLS_ERR_NET_INVALID_CONTEXT;
+        }
+
+        auto result = socket->send(reinterpret_cast<const char*>(buf), len);
+        if (result)
+        {
+            return static_cast<int>(result.bytes);
+        }
+
+        if (result.wouldBlock())
+        {
+            return MBEDTLS_ERR_SSL_WANT_WRITE;
+        }
+
+        if (result.closed())
+        {
+            return MBEDTLS_ERR_NET_CONN_RESET;
+        }
+
+        return MBEDTLS_ERR_NET_SEND_FAILED;
+    }
+
+    int SocketMbedTLS::recvFromSocket(void* ctx, unsigned char* buf, size_t len)
+    {
+        auto* socket = static_cast<Socket*>(ctx);
+        if (socket == nullptr)
+        {
+            return MBEDTLS_ERR_NET_INVALID_CONTEXT;
+        }
+
+        auto result = socket->recv(reinterpret_cast<char*>(buf), len);
+        if (result)
+        {
+            return static_cast<int>(result.bytes);
+        }
+
+        if (result.wouldBlock())
+        {
+            return MBEDTLS_ERR_SSL_WANT_READ;
+        }
+
+        if (result.closed())
+        {
+            return 0;
+        }
+
+        return MBEDTLS_ERR_NET_RECV_FAILED;
+    }
+
+    int SocketMbedTLS::sendFromRawSocket(void* ctx, const unsigned char* buf, size_t len)
+    {
+        auto* socket = static_cast<SocketMbedTLS*>(ctx);
+        if (socket == nullptr)
+        {
+            return MBEDTLS_ERR_NET_INVALID_CONTEXT;
+        }
+
+        auto result = socket->Socket::send(reinterpret_cast<const char*>(buf), len);
+        if (result)
+        {
+            return static_cast<int>(result.bytes);
+        }
+
+        if (result.wouldBlock())
+        {
+            return MBEDTLS_ERR_SSL_WANT_WRITE;
+        }
+
+        if (result.closed())
+        {
+            return MBEDTLS_ERR_NET_CONN_RESET;
+        }
+
+        return MBEDTLS_ERR_NET_SEND_FAILED;
+    }
+
+    int SocketMbedTLS::recvFromRawSocket(void* ctx, unsigned char* buf, size_t len)
+    {
+        auto* socket = static_cast<SocketMbedTLS*>(ctx);
+        if (socket == nullptr)
+        {
+            return MBEDTLS_ERR_NET_INVALID_CONTEXT;
+        }
+
+        auto result = socket->Socket::recv(reinterpret_cast<char*>(buf), len);
+        if (result)
+        {
+            return static_cast<int>(result.bytes);
+        }
+
+        if (result.wouldBlock())
+        {
+            return MBEDTLS_ERR_SSL_WANT_READ;
+        }
+
+        if (result.closed())
+        {
+            return 0;
+        }
+
+        return MBEDTLS_ERR_NET_RECV_FAILED;
     }
 
     bool SocketMbedTLS::init(const std::string& host, bool isClient, std::string& errMsg)
@@ -212,10 +412,17 @@ namespace ix
             }
         }
 
+        _tlsReady = true;
         return true;
     }
 
     bool SocketMbedTLS::accept(std::string& errMsg)
+    {
+        return accept(errMsg, nullptr);
+    }
+
+    bool SocketMbedTLS::accept(std::string& errMsg,
+                               const CancellationRequest& isCancellationRequested)
     {
         bool isClient = false;
         bool initialized = init(std::string(), isClient, errMsg);
@@ -225,13 +432,30 @@ namespace ix
             return false;
         }
 
-        mbedtls_ssl_set_bio(&_ssl, &_sockfd, mbedtls_net_send, mbedtls_net_recv, NULL);
+        mbedtls_ssl_set_bio(
+            &_ssl, this, &SocketMbedTLS::sendFromRawSocket, &SocketMbedTLS::recvFromRawSocket, NULL);
 
         int res;
         do
         {
-            std::lock_guard<std::mutex> lock(_mutex);
-            res = mbedtls_ssl_handshake(&_ssl);
+            {
+                std::lock_guard<std::mutex> lock(_mutex);
+                res = mbedtls_ssl_handshake(&_ssl);
+            }
+
+            if (isCancellationRequested && isCancellationRequested())
+            {
+                errMsg = "Cancellation requested";
+                close();
+                return false;
+            }
+
+            if ((res == MBEDTLS_ERR_SSL_WANT_READ || res == MBEDTLS_ERR_SSL_WANT_WRITE) &&
+                !waitForMbedTlsIo(*this, res, isCancellationRequested, errMsg))
+            {
+                close();
+                return false;
+            }
         } while (res == MBEDTLS_ERR_SSL_WANT_READ || res == MBEDTLS_ERR_SSL_WANT_WRITE);
 
         if (res != 0)
@@ -264,27 +488,7 @@ namespace ix
                                 std::string& errMsg,
                                 const CancellationRequest& isCancellationRequested)
     {
-        {
-            std::lock_guard<std::mutex> lock(_mutex);
-            if (_proxyConfig.isEnabled())
-            {
-                _sockfd = SocketConnect::connect(_proxyConfig.host, _proxyConfig.port,
-                                                 errMsg, isCancellationRequested);
-                if (_sockfd == -1) return false;
-
-                if (!ProxyConnect::connect(_sockfd, _proxyConfig, host, port,
-                                           errMsg, isCancellationRequested))
-                {
-                    close();
-                    return false;
-                }
-            }
-            else
-            {
-                _sockfd = SocketConnect::connect(host, port, errMsg, isCancellationRequested);
-                if (_sockfd == -1) return false;
-            }
-        }
+        if (!Socket::connect(host, port, errMsg, isCancellationRequested)) return false;
 
         bool isClient = true;
         bool initialized = init(host, isClient, errMsg);
@@ -294,7 +498,16 @@ namespace ix
             return false;
         }
 
-        mbedtls_ssl_set_bio(&_ssl, &_sockfd, mbedtls_net_send, mbedtls_net_recv, NULL);
+        if (getProxySocket())
+        {
+            mbedtls_ssl_set_bio(
+                &_ssl, getProxySocket(), &SocketMbedTLS::sendFromSocket, &SocketMbedTLS::recvFromSocket, NULL);
+        }
+        else
+        {
+            mbedtls_ssl_set_bio(
+                &_ssl, this, &SocketMbedTLS::sendFromRawSocket, &SocketMbedTLS::recvFromRawSocket, NULL);
+        }
 
         int res;
         do
@@ -304,9 +517,16 @@ namespace ix
                 res = mbedtls_ssl_handshake(&_ssl);
             }
 
-            if (isCancellationRequested())
+            if (isCancellationRequested && isCancellationRequested())
             {
                 errMsg = "Cancellation requested";
+                close();
+                return false;
+            }
+
+            if ((res == MBEDTLS_ERR_SSL_WANT_READ || res == MBEDTLS_ERR_SSL_WANT_WRITE) &&
+                !waitForMbedTlsIo(*this, res, isCancellationRequested, errMsg))
+            {
                 close();
                 return false;
             }
@@ -331,6 +551,7 @@ namespace ix
     {
         std::lock_guard<std::mutex> lock(_mutex);
 
+        _tlsReady = false;
         mbedtls_ssl_free(&_ssl);
         mbedtls_ssl_config_free(&_conf);
         mbedtls_ctr_drbg_free(&_ctr_drbg);
@@ -338,10 +559,9 @@ namespace ix
         mbedtls_x509_crt_free(&_cacert);
         mbedtls_x509_crt_free(&_cert);
         mbedtls_pk_free(&_pkey);
-        if (MBEDTLS_VERSION_MAJOR >= 3 && MBEDTLS_VERSION_MINOR >= 6 && MBEDTLS_VERSION_PATCH >= 0)
-        {
-            mbedtls_psa_crypto_free();
-        }
+#ifdef IXWEBSOCKET_USE_MBED_TLS_MIN_VERSION_3
+        mbedtls_psa_crypto_free();
+#endif
 
         Socket::close();
     }
@@ -350,7 +570,14 @@ namespace ix
     {
         std::lock_guard<std::mutex> lock(_mutex);
 
-        int res = mbedtls_ssl_write(&_ssl, (const unsigned char*) buf, nbyte);
+        if (!_tlsReady)
+        {
+            return {0, IoError::ConnectionClosed};
+        }
+
+        const size_t writeSize =
+            std::min(nbyte, static_cast<size_t>(std::numeric_limits<int>::max()));
+        int res = mbedtls_ssl_write(&_ssl, (const unsigned char*) buf, writeSize);
 
         if (res > 0) return {static_cast<size_t>(res), IoError::Success};
         if (res == MBEDTLS_ERR_SSL_WANT_READ || res == MBEDTLS_ERR_SSL_WANT_WRITE)
@@ -366,7 +593,14 @@ namespace ix
         {
             std::lock_guard<std::mutex> lock(_mutex);
 
-            int res = mbedtls_ssl_read(&_ssl, (unsigned char*) buf, (int) nbyte);
+            if (!_tlsReady)
+            {
+                return {0, IoError::ConnectionClosed};
+            }
+
+            const int readSize = static_cast<int>(
+                std::min(nbyte, static_cast<size_t>(std::numeric_limits<int>::max())));
+            int res = mbedtls_ssl_read(&_ssl, (unsigned char*) buf, readSize);
 
             if (res > 0) return {static_cast<size_t>(res), IoError::Success};
             if (res == 0) return {0, IoError::ConnectionClosed};

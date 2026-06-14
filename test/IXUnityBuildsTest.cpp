@@ -5,6 +5,7 @@
  */
 
 #include "catch.hpp"
+#include <cstring>
 #include <ixwebsocket/IXCancellationRequest.h>
 #include <ixwebsocket/IXConnectionState.h>
 #include <ixwebsocket/IXDNSLookup.h>
@@ -17,7 +18,6 @@
 #include <ixwebsocket/IXSelectInterruptFactory.h>
 #include <ixwebsocket/IXSetThreadName.h>
 #include <ixwebsocket/IXSocket.h>
-#include <ixwebsocket/IXSocketAppleSSL.h>
 #include <ixwebsocket/IXSocketConnect.h>
 #include <ixwebsocket/IXSocketFactory.h>
 #include <ixwebsocket/IXSocketMbedTLS.h>
@@ -48,5 +48,16 @@ TEST_CASE("unity build", "[unity_build]")
     SECTION("dummy test")
     {
         REQUIRE(true);
+    }
+
+    SECTION("websocket handshake accept key is nul terminated")
+    {
+        char output[29];
+        std::memset(output, 'x', sizeof(output));
+
+        WebSocketHandshakeKeyGen::generate("dGhlIHNhbXBsZSBub25jZQ==", output);
+
+        REQUIRE(std::string(output) == "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
+        REQUIRE(output[28] == '\0');
     }
 }

@@ -5,14 +5,16 @@
 cmake_minimum_required (VERSION 3.14)
 project (ixwebsocket_unittest)
 
-set (CMAKE_CXX_STANDARD 11)
+set (CMAKE_CXX_STANDARD 17)
 
 option(USE_TLS "Add TLS support" ON)
 
 # Shared sources
 set (TEST_TARGET_NAMES
+  IXBase64Test
   IXSocketTest
   IXSocketConnectTest
+  IXProxyConnectTest
   IXWebSocketServerTest
   IXWebSocketTestConnectionDisconnection
   IXUrlParserTest
@@ -27,6 +29,8 @@ set (TEST_TARGET_NAMES
   IXWebSocketCloseTest
   IXWebSocketHostTest
   IXWebSocketIPv6Test
+  IXWebSocketPingTest
+  IXWebSocketPingTimeoutTest
 )
 
 # Some unittest don't work on windows yet
@@ -45,10 +49,6 @@ if (USE_ZLIB)
     IXWebSocketPerMessageDeflateCompressorTest
   )
 endif()
-
-# Ping test fails intermittently, disabling them for now
-# IXWebSocketPingTest.cpp
-# IXWebSocketPingTimeoutTest.cpp
 
 # IXWebSocketLeakTest.cpp # commented until we have a fix for #224 /
 # that was was fixed but now the test does not compile

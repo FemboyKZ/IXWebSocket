@@ -11,8 +11,6 @@
 #include <ixsentry/IXSentryClient.h>
 #include <string.h>
 
-using namespace ix;
-
 namespace ix
 {
     TEST_CASE("sentry", "[sentry]")

@@ -10,9 +10,8 @@
 #include "catch.hpp"
 #include <iostream>
 #include <ixwebsocket/IXWebSocketPerMessageDeflateCodec.h>
+#include <ixwebsocket/IXWebSocketPerMessageDeflateOptions.h>
 #include <string.h>
-
-using namespace ix;
 
 namespace ix
 {
@@ -56,8 +55,8 @@ namespace ix
             REQUIRE(compressAndDecompress("foo") == "foo");
             REQUIRE(compressAndDecompress("bar") == "bar");
             REQUIRE(compressAndDecompress("asdcaseqw`21897dehqwed") == "asdcaseqw`21897dehqwed");
-            REQUIRE(compressAndDecompress("/usr/local/include/ixwebsocket/IXSocketAppleSSL.h") ==
-                    "/usr/local/include/ixwebsocket/IXSocketAppleSSL.h");
+            REQUIRE(compressAndDecompress("/usr/local/include/ixwebsocket/IXSocketOpenSSL.h") ==
+                    "/usr/local/include/ixwebsocket/IXSocketOpenSSL.h");
         }
 
         SECTION("vector api")
@@ -68,8 +67,31 @@ namespace ix
             REQUIRE(compressAndDecompressVector("asdcaseqw`21897dehqwed") ==
                     "asdcaseqw`21897dehqwed");
             REQUIRE(
-                compressAndDecompressVector("/usr/local/include/ixwebsocket/IXSocketAppleSSL.h") ==
-                "/usr/local/include/ixwebsocket/IXSocketAppleSSL.h");
+                compressAndDecompressVector("/usr/local/include/ixwebsocket/IXSocketOpenSSL.h") ==
+                "/usr/local/include/ixwebsocket/IXSocketOpenSSL.h");
+        }
+
+        SECTION("options parser clamps malformed window bits before narrowing")
+        {
+            WebSocketPerMessageDeflateOptions explicitOptions(true, false, false, 1, 255);
+            REQUIRE(static_cast<int>(explicitOptions.getClientMaxWindowBits()) == 9);
+            REQUIRE(static_cast<int>(explicitOptions.getServerMaxWindowBits()) == 15);
+
+            WebSocketPerMessageDeflateOptions negative(
+                "permessage-deflate; server_max_window_bits=-1; client_max_window_bits=-1");
+            REQUIRE(negative.enabled());
+            REQUIRE(static_cast<int>(negative.getServerMaxWindowBits()) == 8);
+            REQUIRE(static_cast<int>(negative.getClientMaxWindowBits()) == 9);
+
+            WebSocketPerMessageDeflateOptions oversized(
+                "permessage-deflate; server_max_window_bits=999; client_max_window_bits=999");
+            REQUIRE(static_cast<int>(oversized.getServerMaxWindowBits()) == 15);
+            REQUIRE(static_cast<int>(oversized.getClientMaxWindowBits()) == 15);
+
+            WebSocketPerMessageDeflateOptions malformed(
+                "permessage-deflate; server_max_window_bits=12x; client_max_window_bits=12x");
+            REQUIRE(static_cast<int>(malformed.getServerMaxWindowBits()) == 8);
+            REQUIRE(static_cast<int>(malformed.getClientMaxWindowBits()) == 9);
         }
     }
 

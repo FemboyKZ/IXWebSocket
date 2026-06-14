@@ -27,23 +27,45 @@ namespace ix
     // Record and report websocket traffic
     void setupWebSocketTrafficTrackerCallback();
     void reportWebSocketTraffic();
+    bool isTestLoggingEnabled();
 
     struct TLogger
     {
     public:
+        TLogger() = default;
+        TLogger(const TLogger&) = delete;
+        TLogger& operator=(const TLogger&) = delete;
+
+        ~TLogger()
+        {
+            auto message = _stream.str();
+            if (message.empty()) return;
+
+            if (!isTestLoggingEnabled())
+            {
+                bool isErrorMessage = message.find("error") != std::string::npos ||
+                                      message.find("Error") != std::string::npos ||
+                                      message.find("FAILED") != std::string::npos;
+                if (!isErrorMessage) return;
+            }
+
+            std::lock_guard<std::mutex> lock(_mutex);
+            if (message == _lastMessage) return;
+            _lastMessage = message;
+            spdlog::info(message);
+        }
+
         template<typename T>
         TLogger& operator<<(T const& obj)
         {
-            std::lock_guard<std::mutex> lock(_mutex);
-
-            std::stringstream ss;
-            ss << obj;
-            spdlog::info(ss.str());
+            _stream << obj;
             return *this;
         }
 
     private:
+        std::stringstream _stream;
         static std::mutex _mutex;
+        static std::string _lastMessage;
     };
 
     void log(const std::string& msg);

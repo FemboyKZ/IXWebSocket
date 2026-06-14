@@ -15,6 +15,7 @@ namespace
     // is treated as a char* and the null termination (\x00) makes it
     // look like an empty string.
     const std::string kEmptyUncompressedBlock = std::string("\x00\x00\xff\xff", 4);
+    constexpr size_t kMaxDeflatedMessageSize = 64ULL * 1024ULL * 1024ULL;
 } // namespace
 
 namespace ix
@@ -120,6 +121,11 @@ namespace ix
         // Clear output
         out.clear();
 
+        if (in.size() > kMaxDeflatedMessageSize)
+        {
+            return false;
+        }
+
         if (in.empty())
         {
             // See issue #167
@@ -141,7 +147,12 @@ namespace ix
             _deflateState.avail_out = (uInt) _compressBuffer.size();
             _deflateState.next_out = &_compressBuffer.front();
 
-            deflate(&_deflateState, _flush);
+            int ret = deflate(&_deflateState, _flush);
+            if (ret != Z_OK)
+            {
+                out.clear();
+                return false;
+            }
 
             output = _compressBuffer.size() - _deflateState.avail_out;
 
@@ -205,6 +216,11 @@ namespace ix
         // Clear output
         out.clear();
 
+        if (in.size() > kMaxDeflatedMessageSize)
+        {
+            return false;
+        }
+
         // First decompress the input data
         _inflateState.avail_in = (uInt) in.size();
         _inflateState.next_in = (unsigned char*) (const_cast<char*>(in.data()));
@@ -216,13 +232,20 @@ namespace ix
 
             int ret = inflate(&_inflateState, Z_NO_FLUSH);
 
-            if (ret == Z_NEED_DICT || ret == Z_DATA_ERROR || ret == Z_MEM_ERROR)
+            if (ret == Z_NEED_DICT || ret == Z_DATA_ERROR || ret == Z_MEM_ERROR ||
+                ret == Z_BUF_ERROR)
             {
                 return false;
             }
 
-            out.append(reinterpret_cast<char*>(&_compressBuffer.front()),
-                       _compressBuffer.size() - _inflateState.avail_out);
+            const size_t outputSize = _compressBuffer.size() - _inflateState.avail_out;
+            if (outputSize > kMaxDeflatedMessageSize - out.size())
+            {
+                out.clear();
+                return false;
+            }
+
+            out.append(reinterpret_cast<char*>(&_compressBuffer.front()), outputSize);
         } while (_inflateState.avail_out == 0);
 
         // Then decompress the empty block suffix
@@ -236,13 +259,20 @@ namespace ix
 
             int ret = inflate(&_inflateState, Z_SYNC_FLUSH);
 
-            if (ret == Z_NEED_DICT || ret == Z_DATA_ERROR || ret == Z_MEM_ERROR)
+            if (ret == Z_NEED_DICT || ret == Z_DATA_ERROR || ret == Z_MEM_ERROR ||
+                ret == Z_BUF_ERROR)
             {
                 return false;
             }
 
-            out.append(reinterpret_cast<char*>(&_compressBuffer.front()),
-                       _compressBuffer.size() - _inflateState.avail_out);
+            const size_t outputSize = _compressBuffer.size() - _inflateState.avail_out;
+            if (outputSize > kMaxDeflatedMessageSize - out.size())
+            {
+                out.clear();
+                return false;
+            }
+
+            out.append(reinterpret_cast<char*>(&_compressBuffer.front()), outputSize);
         } while (_inflateState.avail_out == 0);
 
         return true;

@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <locale>
+#include <string_view>
 
 namespace ix
 {
@@ -35,7 +36,7 @@ namespace ix
         return CaseInsensitiveLess::cmp(s1, s2);
     }
 
-    bool caseInsensitiveEquals(const std::string& a, const std::string& b)
+    bool caseInsensitiveEquals(std::string_view a, std::string_view b)
     {
         if (a.size() != b.size()) return false;
         return std::equal(a.begin(), a.end(), b.begin(), [](unsigned char c1, unsigned char c2) {
@@ -45,5 +46,20 @@ namespace ix
             return std::tolower(c1) == std::tolower(c2);
 #endif
         });
+    }
+
+    bool caseInsensitiveEquals(const std::string& a, const std::string& b)
+    {
+        return caseInsensitiveEquals(std::string_view(a), std::string_view(b));
+    }
+
+    bool caseInsensitiveStartsWith(std::string_view value, std::string_view prefix)
+    {
+        if (value.size() < prefix.size())
+        {
+            return false;
+        }
+
+        return caseInsensitiveEquals(value.substr(0, prefix.size()), prefix);
     }
 } // namespace ix

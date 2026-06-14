@@ -4,6 +4,7 @@
  *  Copyright (c) 2019 Machine Zone. All rights reserved.
  */
 
+#include "IXTest.h"
 #include "catch.hpp"
 #include <cstdint>
 #include <iostream>
@@ -12,6 +13,34 @@
 #include <ixwebsocket/IXHttpServer.h>
 
 using namespace ix;
+
+namespace
+{
+    void logHttpClientMessage(const std::string& msg)
+    {
+        std::string line = msg;
+        while (!line.empty() && (line.back() == '\n' || line.back() == '\r'))
+        {
+            line.pop_back();
+        }
+
+        if (!line.empty())
+        {
+            ix::TLogger() << line;
+        }
+    }
+
+    bool reportDownloadProgress(uint64_t current, uint64_t total)
+    {
+        if (total > 0 && current < total)
+        {
+            return true;
+        }
+
+        ix::TLogger() << "Downloaded " << current << " bytes out of " << total;
+        return true;
+    }
+} // namespace
 
 TEST_CASE("http_client", "[http]")
 {
@@ -30,12 +59,8 @@ TEST_CASE("http_client", "[http]")
         args->maxRedirects = 10;
         args->verbose = true;
         args->compress = true;
-        args->logger = [](const std::string& msg) { std::cout << msg; };
-        args->onProgressCallback = [](int current, int total) -> bool {
-            std::cerr << "\r"
-                      << "Downloaded " << current << " bytes out of " << total;
-            return true;
-        };
+        args->logger = logHttpClientMessage;
+        args->onProgressCallback = reportDownloadProgress;
 
         auto response = httpClient.get(url, args);
 
@@ -73,12 +98,8 @@ TEST_CASE("http_client", "[http]")
         args->maxRedirects = 10;
         args->verbose = true;
         args->compress = true;
-        args->logger = [](const std::string& msg) { std::cout << msg; };
-        args->onProgressCallback = [](int current, int total) -> bool {
-            std::cerr << "\r"
-                      << "Downloaded " << current << " bytes out of " << total;
-            return true;
-        };
+        args->logger = logHttpClientMessage;
+        args->onProgressCallback = reportDownloadProgress;
 
         auto response = httpClient.get(url, args);
 
@@ -97,7 +118,7 @@ TEST_CASE("http_client", "[http]")
     }
 #endif
 
-#if defined(IXWEBSOCKET_USE_TLS) && !defined(IXWEBSOCKET_USE_SECURE_TRANSPORT)
+#if defined(IXWEBSOCKET_USE_TLS)
     SECTION("Disable hostname validation")
     {
         static auto test_cert_with_wrong_name = [](bool validate_hostname)
@@ -163,12 +184,8 @@ TEST_CASE("http_client", "[http]")
         args->maxRedirects = 10;
         args->verbose = true;
         args->compress = true;
-        args->logger = [](const std::string& msg) { std::cout << msg; };
-        args->onProgressCallback = [](int current, int total) -> bool {
-            std::cerr << "\r"
-                      << "Downloaded " << current << " bytes out of " << total;
-            return true;
-        };
+        args->logger = logHttpClientMessage;
+        args->onProgressCallback = reportDownloadProgress;
 
         std::atomic<bool> requestCompleted(false);
         std::atomic<int> statusCode(0);
@@ -215,12 +232,8 @@ TEST_CASE("http_client", "[http]")
         args->maxRedirects = 10;
         args->verbose = true;
         args->compress = true;
-        args->logger = [](const std::string& msg) { std::cout << msg; };
-        args->onProgressCallback = [](int current, int total) -> bool {
-            std::cerr << "\r"
-                      << "Downloaded " << current << " bytes out of " << total;
-            return true;
-        };
+        args->logger = logHttpClientMessage;
+        args->onProgressCallback = reportDownloadProgress;
 
         std::atomic<bool> requestCompleted(false);
         std::atomic<int> statusCode0(0);
@@ -291,12 +304,8 @@ TEST_CASE("http_client", "[http]")
         args->maxRedirects = 10;
         args->verbose = true;
         args->compress = true;
-        args->logger = [](const std::string& msg) { std::cout << msg; };
-        args->onProgressCallback = [](int current, int total) -> bool {
-            std::cerr << "\r"
-                      << "Downloaded " << current << " bytes out of " << total;
-            return true;
-        };
+        args->logger = logHttpClientMessage;
+        args->onProgressCallback = reportDownloadProgress;
 
         std::atomic<bool> requestCompleted(false);
         std::atomic<HttpErrorCode> errorCode(HttpErrorCode::Invalid);
@@ -344,12 +353,8 @@ TEST_CASE("http_client", "[http]")
         args->maxRedirects = 10;
         args->verbose = true;
         args->compress = false;
-        args->logger = [](const std::string& msg) { std::cout << msg; };
-        args->onProgressCallback = [](int current, int total) -> bool {
-            std::cerr << "\r"
-                      << "Downloaded " << current << " bytes out of " << total;
-            return true;
-        };
+        args->logger = logHttpClientMessage;
+        args->onProgressCallback = reportDownloadProgress;
 
         // compute Adler-32 checksum of received data
         uint32_t a = 1, b = 0;

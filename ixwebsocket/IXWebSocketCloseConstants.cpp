@@ -13,6 +13,7 @@ namespace ix
     const uint16_t WebSocketCloseConstants::kAbnormalCloseCode(1006);
     const uint16_t WebSocketCloseConstants::kInvalidFramePayloadData(1007);
     const uint16_t WebSocketCloseConstants::kProtocolErrorCode(1002);
+    const uint16_t WebSocketCloseConstants::kMessageTooBigCode(1009);
     const uint16_t WebSocketCloseConstants::kNoStatusCodeErrorCode(1005);
 
     const std::string WebSocketCloseConstants::kNormalClosureMessage("Normal closure");
@@ -30,6 +31,7 @@ namespace ix
         "Fragmentation: data message out of sequence");
     const std::string WebSocketCloseConstants::kProtocolErrorCodeContinuationOpCodeOutOfSequence(
         "Fragmentation: continuation opcode out of sequence");
+    const std::string WebSocketCloseConstants::kMessageTooBigMessage("Message too big");
     const std::string WebSocketCloseConstants::kInvalidFramePayloadDataMessage(
         "Invalid frame payload data");
     const std::string WebSocketCloseConstants::kInvalidCloseCodeMessage("Invalid close code");

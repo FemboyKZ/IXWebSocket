@@ -10,8 +10,6 @@
 #include <ixwebsocket/IXExponentialBackoff.h>
 #include <string.h>
 
-using namespace ix;
-
 namespace ix
 {
     TEST_CASE("exponential_backoff", "[exponential_backoff]")
@@ -28,10 +26,9 @@ namespace ix
             REQUIRE(calculateRetryWaitMilliseconds(6, 10000, 100) == 6400);
             REQUIRE(calculateRetryWaitMilliseconds(20, 10000, 100) == 10000);
             REQUIRE(calculateRetryWaitMilliseconds(25, 10000, 100) == 10000);
-            
+
             // Things get special after 26 retries
             REQUIRE(calculateRetryWaitMilliseconds(26, 10000, 100) == 10000);
-            REQUIRE(calculateRetryWaitMilliseconds(27, 10000, 100) == 10000);
             REQUIRE(calculateRetryWaitMilliseconds(27, 10000, 100) == 10000);
         }
     }

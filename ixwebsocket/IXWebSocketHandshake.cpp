@@ -8,15 +8,77 @@
 
 #include "IXBase64.h"
 #include "IXHttp.h"
+#include "IXSecureRandom.h"
 #include "IXSocketConnect.h"
-#include "IXStrCaseCompare.h"
 #include "IXUrlParser.h"
 #include "IXUserAgent.h"
 #include "IXWebSocketHandshakeKeyGen.h"
 #include <algorithm>
-#include <random>
+#include <charconv>
 #include <sstream>
+#include <string_view>
 #include <tuple>
+
+namespace
+{
+    bool isBase64Character(char c)
+    {
+        return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+               (c >= '0' && c <= '9') || c == '+' || c == '/';
+    }
+
+    bool isValidSecWebSocketKey(const std::string& value)
+    {
+        if (value.size() != 24)
+        {
+            return false;
+        }
+
+        size_t padding = 0;
+        bool seenPadding = false;
+        for (size_t i = 0; i < value.size(); ++i)
+        {
+            if (value[i] == '=')
+            {
+                seenPadding = true;
+                ++padding;
+                if (i < value.size() - 2)
+                {
+                    return false;
+                }
+            }
+            else
+            {
+                if (seenPadding || !isBase64Character(value[i]))
+                {
+                    return false;
+                }
+            }
+        }
+
+        if (padding != 2)
+        {
+            return false;
+        }
+
+        std::string decoded;
+        if (!macaron::Base64::Decode(value, decoded).empty())
+        {
+            return false;
+        }
+
+        return decoded.size() == 16;
+    }
+
+    bool isRestrictedClientHandshakeHeader(std::string_view name)
+    {
+        return ix::caseInsensitiveEquals(name, "connection") ||
+               ix::caseInsensitiveEquals(name, "upgrade") ||
+               ix::caseInsensitiveEquals(name, "sec-websocket-key") ||
+               ix::caseInsensitiveEquals(name, "sec-websocket-version") ||
+               ix::caseInsensitiveEquals(name, "sec-websocket-extensions");
+    }
+} // namespace
 
 namespace ix
 {
@@ -34,50 +96,36 @@ namespace ix
     {
     }
 
-    bool WebSocketHandshake::insensitiveStringCompare(const std::string& a, const std::string& b)
+    bool WebSocketHandshake::genRandomBytes(size_t size, std::string& bytes)
     {
-        return CaseInsensitiveLess::cmp(a, b) == 0;
-    }
-
-    std::string WebSocketHandshake::genRandomString(const int len)
-    {
-        std::string alphanum = "0123456789"
-                               "ABCDEFGH"
-                               "abcdefgh";
-
-        std::random_device r;
-        std::default_random_engine e1(r());
-        std::uniform_int_distribution<int> dist(0, (int) alphanum.size() - 1);
-
-        std::string s;
-        s.resize(len);
-
-        for (int i = 0; i < len; ++i)
-        {
-            int x = dist(e1);
-            s[i] = alphanum[x];
-        }
-
-        return s;
+        bytes.assign(size, '\0');
+        return secureRandomBytes(bytes.data(), bytes.size());
     }
 
     WebSocketInitResult WebSocketHandshake::sendErrorResponse(int code, const std::string& reason)
     {
+        std::string customServer = getCustomServerHeader();
+        std::string serverHeader = customServer.empty() ? userAgent() : customServer;
+        if (!isValidHttpHeaderValue(reason) || !isValidHttpHeaderValue(serverHeader))
+        {
+            return WebSocketInitResult(false, code, reason);
+        }
+
         std::stringstream ss;
         ss << "HTTP/1.1 ";
         ss << code;
         ss << " ";
         ss << reason;
         ss << "\r\n";
-        const std::string& customServer = getCustomServerHeader();
-        ss << "Server: " << (customServer.empty() ? userAgent() : customServer) << "\r\n";
+        ss << "Server: " << serverHeader << "\r\n";
+        ss << "\r\n";
 
         // Socket write can only be cancelled through a timeout here, not manually.
         static std::atomic<bool> requestInitCancellation(false);
         auto isCancellationRequested =
             makeCancellationRequestWithTimeout(1, requestInitCancellation);
 
-        if (!_socket->writeBytes(ss.str(), isCancellationRequested))
+        if (!_socket->writeBytes(ss.str(), isCancellationRequested, 1))
         {
             return WebSocketInitResult(false, 500, "Timed out while sending error response");
         }
@@ -99,6 +147,35 @@ namespace ix
         auto isCancellationRequested =
             makeCancellationRequestWithTimeout(timeoutSecs, _requestInitCancellation);
 
+        if (!isValidHttpAuthority(host))
+        {
+            return WebSocketInitResult(false, 0, "Invalid HTTP host");
+        }
+
+        if (!isValidHttpRequestTarget(path))
+        {
+            return WebSocketInitResult(false, 0, "Invalid HTTP request target");
+        }
+
+        for (const auto& [name, value] : extraHeaders)
+        {
+            if (!isValidHttpHeaderName(name) || !isValidHttpHeaderValue(value))
+            {
+                return WebSocketInitResult(false, 0, "Invalid HTTP header: " + name);
+            }
+
+            if (isRestrictedClientHandshakeHeader(name))
+            {
+                return WebSocketInitResult(false, 0, "Restricted WebSocket header: " + name);
+            }
+        }
+
+        if (extraHeaders.find("User-Agent") == extraHeaders.end() &&
+            !isValidHttpHeaderValue(userAgent()))
+        {
+            return WebSocketInitResult(false, 0, "Invalid default User-Agent header value");
+        }
+
         std::string errMsg;
         bool success = _socket->connect(host, port, errMsg, isCancellationRequested);
 
@@ -112,13 +189,18 @@ namespace ix
         // Generate a random 16 bytes string and base64 encode it.
         //
         // See https://stackoverflow.com/questions/18265128/what-is-sec-websocket-key-for
-        std::string secWebSocketKey = macaron::Base64::Encode(genRandomString(16));
+        std::string secWebSocketKeyBytes;
+        if (!genRandomBytes(16, secWebSocketKeyBytes))
+        {
+            return WebSocketInitResult(false, 0, "Unable to generate Sec-WebSocket-Key");
+        }
+        std::string secWebSocketKey = macaron::Base64::Encode(secWebSocketKeyBytes);
 
         std::stringstream ss;
         ss << "GET " << path << " HTTP/1.1\r\n";
         if (extraHeaders.find("Host") == extraHeaders.end())
         {
-            ss << "Host: " << host << ":" << port << "\r\n";
+            ss << "Host: " << formatHttpHost(host) << ":" << port << "\r\n";
         }
         ss << "Upgrade: websocket\r\n";
         ss << "Connection: Upgrade\r\n";
@@ -134,7 +216,7 @@ namespace ix
         // Set an origin header if missing
         if (extraHeaders.find("Origin") == extraHeaders.end())
         {
-            ss << "Origin: " << protocol << "://" << host << ":" << port << "\r\n";
+            ss << "Origin: " << protocol << "://" << formatHttpHost(host) << ":" << port << "\r\n";
         }
 
         for (const auto& [name, value] : extraHeaders)
@@ -149,14 +231,14 @@ namespace ix
 
         ss << "\r\n";
 
-        if (!_socket->writeBytes(ss.str(), isCancellationRequested))
+        if (!_socket->writeBytes(ss.str(), isCancellationRequested, timeoutSecs))
         {
             return WebSocketInitResult(
                 false, 0, std::string("Failed sending GET request to ") + url);
         }
 
         // Read HTTP status line
-        auto line = _socket->readLine(isCancellationRequested);
+        auto line = _socket->readLine(isCancellationRequested, timeoutSecs);
         if (!line)
         {
             return WebSocketInitResult(
@@ -176,7 +258,7 @@ namespace ix
             return WebSocketInitResult(false, status, ss.str());
         }
 
-        auto headersOpt = parseHttpHeaders(_socket, isCancellationRequested);
+        auto headersOpt = parseHttpHeaders(_socket, isCancellationRequested, timeoutSecs);
         if (!headersOpt)
         {
             return WebSocketInitResult(false, status, "Error parsing HTTP headers");
@@ -201,16 +283,23 @@ namespace ix
             return WebSocketInitResult(false, status, errorMsg);
         }
 
-        // Check the value of the connection field
-        // Some websocket servers (Go/Gorilla?) send lowercase values for the
-        // connection header, so do a case insensitive comparison
-        //
-        // See https://github.com/apache/thrift/commit/7c4bdf9914fcba6c89e0f69ae48b9675578f084a
-        //
-        if (!insensitiveStringCompare(headers["connection"], "Upgrade"))
+        // Connection can include multiple comma-separated tokens.
+        if (!headerContainsTokenCaseInsensitive(headers["connection"], "upgrade"))
         {
             std::stringstream ss;
             ss << "Invalid connection value: " << headers["connection"];
+            return WebSocketInitResult(false, status, ss.str());
+        }
+
+        if (headers.find("upgrade") == headers.end())
+        {
+            return WebSocketInitResult(false, status, "Missing Upgrade value");
+        }
+
+        if (!headerContainsTokenCaseInsensitive(headers["upgrade"], "websocket"))
+        {
+            std::stringstream ss;
+            ss << "Invalid upgrade value: " << headers["upgrade"];
             return WebSocketInitResult(false, status, ss.str());
         }
 
@@ -220,6 +309,37 @@ namespace ix
         {
             std::string errorMsg("Invalid Sec-WebSocket-Accept value");
             return WebSocketInitResult(false, status, errorMsg);
+        }
+
+        std::string selectedProtocol;
+        auto selectedProtocolIt = headers.find("sec-websocket-protocol");
+        if (selectedProtocolIt != headers.end())
+        {
+            const auto selectedTokens = splitHeaderTokens(selectedProtocolIt->second);
+            if (selectedTokens.size() != 1 || !isValidHttpHeaderName(selectedTokens.front()))
+            {
+                return WebSocketInitResult(
+                    false, status, "Invalid Sec-WebSocket-Protocol value");
+            }
+
+            auto requestedProtocolIt = extraHeaders.find("Sec-WebSocket-Protocol");
+            if (requestedProtocolIt == extraHeaders.end())
+            {
+                return WebSocketInitResult(
+                    false, status, "Unexpected Sec-WebSocket-Protocol value");
+            }
+
+            const auto requestedTokens = splitHeaderTokens(requestedProtocolIt->second);
+            auto requestedIt = std::find(requestedTokens.begin(),
+                                         requestedTokens.end(),
+                                         selectedTokens.front());
+            if (requestedIt == requestedTokens.end())
+            {
+                return WebSocketInitResult(
+                    false, status, "Unexpected Sec-WebSocket-Protocol value");
+            }
+
+            selectedProtocol = std::string(selectedTokens.front());
         }
 
         if (_enablePerMessageDeflate)
@@ -241,7 +361,7 @@ namespace ix
             }
         }
 
-        return WebSocketInitResult(true, status, "", headers, path);
+        return WebSocketInitResult(true, status, "", headers, path, selectedProtocol);
     }
 
     WebSocketInitResult WebSocketHandshake::serverHandshake(int timeoutSecs,
@@ -267,14 +387,18 @@ namespace ix
         else
         {
             // Read first line
-            auto line = _socket->readLine(isCancellationRequested);
+            auto line = _socket->readLine(isCancellationRequested, timeoutSecs);
             if (!line)
             {
                 return sendErrorResponse(400, "Error reading HTTP request line");
             }
 
             // Validate request line (GET /foo HTTP/1.1\r\n)
-            std::tie(method, uri, httpVersion) = Http::parseRequestLine(*line);
+            std::string requestLineError;
+            if (!parseHttpRequestLine(*line, method, uri, httpVersion, requestLineError))
+            {
+                return sendErrorResponse(400, requestLineError);
+            }
         }
 
         if (method != "GET")
@@ -296,7 +420,7 @@ namespace ix
         else
         {
             // Retrieve and validate HTTP headers
-            auto headersOpt = parseHttpHeaders(_socket, isCancellationRequested);
+            auto headersOpt = parseHttpHeaders(_socket, isCancellationRequested, timeoutSecs);
             if (!headersOpt)
             {
                 return sendErrorResponse(400, "Error parsing HTTP headers");
@@ -304,9 +428,26 @@ namespace ix
             headers = std::move(*headersOpt);
         }
 
-        if (headers.find("sec-websocket-key") == headers.end())
+        auto secWebSocketKeyIt = headers.find("sec-websocket-key");
+        if (secWebSocketKeyIt == headers.end())
         {
             return sendErrorResponse(400, "Missing Sec-WebSocket-Key value");
+        }
+
+        if (!isValidSecWebSocketKey(secWebSocketKeyIt->second))
+        {
+            return sendErrorResponse(400, "Invalid Sec-WebSocket-Key value");
+        }
+
+        if (headers.find("connection") == headers.end())
+        {
+            return sendErrorResponse(400, "Missing Connection header");
+        }
+
+        if (!headerContainsTokenCaseInsensitive(headers["connection"], "upgrade"))
+        {
+            return sendErrorResponse(
+                400, "Invalid Connection header, need token Upgrade, got " + headers["connection"]);
         }
 
         if (headers.find("upgrade") == headers.end())
@@ -314,8 +455,7 @@ namespace ix
             return sendErrorResponse(400, "Missing Upgrade header");
         }
 
-        if (!insensitiveStringCompare(headers["upgrade"], "WebSocket") &&
-            headers["Upgrade"] != "keep-alive, Upgrade") // special case for firefox
+        if (!headerContainsTokenCaseInsensitive(headers["upgrade"], "websocket"))
         {
             return sendErrorResponse(400,
                                      "Invalid Upgrade header, "
@@ -329,41 +469,55 @@ namespace ix
         }
 
         {
-            std::stringstream ss;
-            ss << headers["sec-websocket-version"];
-            int version;
-            ss >> version;
+            const std::string& versionHeader = headers["sec-websocket-version"];
+            int version = 0;
+            auto [ptr, ec] = std::from_chars(
+                versionHeader.data(), versionHeader.data() + versionHeader.size(), version);
 
-            if (version != 13)
+            if (ec != std::errc() || ptr != versionHeader.data() + versionHeader.size() ||
+                version != 13)
             {
                 return sendErrorResponse(400,
                                          "Invalid Sec-WebSocket-Version, "
                                          "need 13, got " +
-                                             ss.str());
+                                             versionHeader);
             }
         }
 
         char output[29] = {};
-        WebSocketHandshakeKeyGen::generate(headers["sec-websocket-key"], output);
+        WebSocketHandshakeKeyGen::generate(secWebSocketKeyIt->second, output);
 
         std::stringstream ss;
         ss << "HTTP/1.1 101 Switching Protocols\r\n";
         ss << "Sec-WebSocket-Accept: " << std::string(output) << "\r\n";
         ss << "Upgrade: websocket\r\n";
         ss << "Connection: Upgrade\r\n";
-        const std::string& customServer = getCustomServerHeader();
-        ss << "Server: " << (customServer.empty() ? userAgent() : customServer) << "\r\n";
+        std::string customServer = getCustomServerHeader();
+        std::string serverHeader = customServer.empty() ? userAgent() : customServer;
+        if (!isValidHttpHeaderValue(serverHeader))
+        {
+            return WebSocketInitResult(false, 0, "Invalid Server header value");
+        }
+        ss << "Server: " << serverHeader << "\r\n";
 
         // Handle sub-protocol negotiation
         std::string selectedProtocol;
         auto protocolIt = headers.find("sec-websocket-protocol");
         if (!subProtocols.empty() && protocolIt != headers.end())
         {
-            const std::string& clientProtocols = protocolIt->second;
+            const auto clientProtocols = splitHeaderTokens(protocolIt->second);
             for (const auto& serverProtocol : subProtocols)
             {
-                if (clientProtocols.find(serverProtocol) != std::string::npos)
+                auto clientIt = std::find(clientProtocols.begin(),
+                                          clientProtocols.end(),
+                                          std::string_view(serverProtocol));
+                if (clientIt != clientProtocols.end())
                 {
+                    if (!isValidHttpHeaderName(serverProtocol))
+                    {
+                        return WebSocketInitResult(false, 0, "Invalid Sec-WebSocket-Protocol value");
+                    }
+
                     selectedProtocol = serverProtocol;
                     ss << "Sec-WebSocket-Protocol: " << serverProtocol << "\r\n";
                     break;
@@ -390,12 +544,12 @@ namespace ix
 
         ss << "\r\n";
 
-        if (!_socket->writeBytes(ss.str(), isCancellationRequested))
+        if (!_socket->writeBytes(ss.str(), isCancellationRequested, timeoutSecs))
         {
             return WebSocketInitResult(
                 false, 0, std::string("Failed sending response to remote end"));
         }
 
-        return WebSocketInitResult(true, 200, "", headers, uri, selectedProtocol);
+        return WebSocketInitResult(true, 101, "", headers, uri, selectedProtocol);
     }
 } // namespace ix

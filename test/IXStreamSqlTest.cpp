@@ -10,13 +10,11 @@
 #include <ixsnake/IXStreamSql.h>
 #include <string.h>
 
-using namespace ix;
-
 namespace ix
 {
     TEST_CASE("stream_sql", "[streamsql]")
     {
-        SECTION("expression A")
+        SECTION("session LIKE match")
         {
             snake::StreamSql streamSql(
                 "select * from subscriber_republished_v1_neo where session LIKE '%123456%'");
@@ -26,7 +24,7 @@ namespace ix
             CHECK(streamSql.match(msg));
         }
 
-        SECTION("expression A")
+        SECTION("exact session match")
         {
             snake::StreamSql streamSql("select * from `subscriber_republished_v1_neo` where "
                                        "session = '30091320ed8d4e50b758f8409b83bed7'");

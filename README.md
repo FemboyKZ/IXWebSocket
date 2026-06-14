@@ -6,88 +6,6 @@ IXWebSocket is a C++ library for WebSocket client and server development. It has
 
 It is been used on big mobile video game titles sending and receiving tons of messages since 2017 (iOS and Android). It was tested on macOS, iOS, Linux, Android, Windows and FreeBSD. Two important design goals are simplicity and correctness.
 
-```cpp
-/*
- *  main.cpp
- *  Author: Benjamin Sergeant
- *  Copyright (c) 2020 Machine Zone, Inc. All rights reserved.
- *
- *  Super simple standalone example. See ws folder, unittest and doc/usage.md for more.
- *
- *  On macOS
- *  $ mkdir -p build ; (cd build ; cmake -DUSE_TLS=1 .. ; make -j ; make install)
- *  $ clang++ --std=c++11 --stdlib=libc++ main.cpp -lixwebsocket -lz -framework Security -framework Foundation
- *  $ ./a.out
- *
- *  Or use cmake -DBUILD_DEMO=ON option for other platforms
- */
-
-#include <ixwebsocket/IXNetSystem.h>
-#include <ixwebsocket/IXWebSocket.h>
-#include <ixwebsocket/IXUserAgent.h>
-#include <iostream>
-
-int main()
-{
-    // Required on Windows
-    ix::initNetSystem();
-
-    // Our websocket object
-    ix::WebSocket webSocket;
-
-    // Connect to a server with encryption
-    // See https://machinezone.github.io/IXWebSocket/usage/#tls-support-and-configuration
-    //     https://github.com/machinezone/IXWebSocket/issues/386#issuecomment-1105235227 (self signed certificates)
-    std::string url("wss://echo.websocket.org");
-    webSocket.setUrl(url);
-
-    std::cout << "Connecting to " << url << "..." << std::endl;
-
-    // Setup a callback to be fired (in a background thread, watch out for race conditions !)
-    // when a message or an event (open, close, error) is received
-    webSocket.setOnMessageCallback([](const ix::WebSocketMessagePtr& msg)
-        {
-            if (msg->type == ix::WebSocketMessageType::Message)
-            {
-                std::cout << "received message: " << msg->str << std::endl;
-                std::cout << "> " << std::flush;
-            }
-            else if (msg->type == ix::WebSocketMessageType::Open)
-            {
-                std::cout << "Connection established" << std::endl;
-                std::cout << "> " << std::flush;
-            }
-            else if (msg->type == ix::WebSocketMessageType::Error)
-            {
-                // Maybe SSL is not configured properly
-                std::cout << "Connection error: " << msg->errorInfo.reason << std::endl;
-                std::cout << "> " << std::flush;
-            }
-        }
-    );
-
-    // Now that our callback is setup, we can start our background thread and receive messages
-    webSocket.start();
-
-    // Send a message to the server (default to TEXT mode)
-    webSocket.send("hello world");
-
-    // Display a prompt
-    std::cout << "> " << std::flush;
-
-    std::string text;
-    // Read text from the console and send messages in text mode.
-    // Exit with Ctrl-D on Unix or Ctrl-Z on Windows.
-    while (std::getline(std::cin, text))
-    {
-        webSocket.send(text);
-        std::cout << "> " << std::flush;
-    }
-
-    return 0;
-}
-```
-
 Interested? Go read the [docs](https://machinezone.github.io/IXWebSocket/)! If things don't work as expected, please create an issue on GitHub, or even better a pull request if you know how to fix your problem.
 
 IXWebSocket is actively being developed, check out the [changelog](https://machinezone.github.io/IXWebSocket/CHANGELOG/) to know what's cooking. If you are looking for a real time messaging service (the chat-like 'server' your websocket code will talk to) with many features such as history, backed by Redis, look at [cobra](https://github.com/machinezone/cobra).
@@ -131,7 +49,6 @@ To check the performance of a websocket library, you can look at the [autoroute]
 | OS                | TLS               | Sanitizer         | Status            |
 |-------------------|-------------------|-------------------|-------------------|
 | Linux             | OpenSSL           | None              | [![Build2][1]][0] |
-| macOS             | Secure Transport  | Thread Sanitizer  | [![Build2][2]][0] |
 | macOS             | OpenSSL           | Thread Sanitizer  | [![Build2][3]][0] |
 | macOS             | MbedTLS           | Thread Sanitizer  | [![Build2][4]][0] |
 | Windows           | Disabled          | None              | [![Build2][5]][0] |
@@ -143,10 +60,8 @@ To check the performance of a websocket library, you can look at the [autoroute]
 
 [0]: https://github.com/machinezone/IXWebSocket
 [1]: https://github.com/machinezone/IXWebSocket/workflows/linux/badge.svg
-[2]: https://github.com/machinezone/IXWebSocket/workflows/mac_tsan_sectransport/badge.svg
 [3]: https://github.com/machinezone/IXWebSocket/workflows/mac_tsan_openssl/badge.svg
 [4]: https://github.com/machinezone/IXWebSocket/workflows/mac_tsan_mbedtls/badge.svg
 [5]: https://github.com/machinezone/IXWebSocket/workflows/windows/badge.svg
 [6]: https://github.com/machinezone/IXWebSocket/workflows/uwp/badge.svg
 [7]: https://github.com/machinezone/IXWebSocket/workflows/linux_asan/badge.svg
-

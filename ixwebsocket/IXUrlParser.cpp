@@ -33,10 +33,24 @@
 
 #include <algorithm>
 #include <charconv>
+#include <cctype>
 #include <cstring>
 
 namespace
 {
+    bool containsInvalidUrlCharacter(const std::string& url)
+    {
+        for (unsigned char c : url)
+        {
+            if (c <= 0x20 || c == 0x7f)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     enum LUrlParserError
     {
         LUrlParserError_Ok = 0,
@@ -61,9 +75,11 @@ namespace
         std::string m_Fragment;
         std::string m_UserName;
         std::string m_Password;
+        bool m_HasPort;
 
         clParseURL()
             : m_ErrorCode(LUrlParserError_Uninitialized)
+            , m_HasPort(false)
         {
         }
 
@@ -83,15 +99,30 @@ namespace
     private:
         explicit clParseURL(LUrlParserError ErrorCode)
             : m_ErrorCode(ErrorCode)
+            , m_HasPort(false)
         {
         }
     };
 
     static bool IsSchemeValid(const std::string& SchemeName)
     {
+        if (SchemeName.empty())
+        {
+            return false;
+        }
+
+        if (!std::isalpha(static_cast<unsigned char>(SchemeName[0])))
+        {
+            return false;
+        }
+
         for (auto c : SchemeName)
         {
-            if (!isalpha(c) && c != '+' && c != '-' && c != '.') return false;
+            if (!std::isalnum(static_cast<unsigned char>(c)) && c != '+' && c != '-' &&
+                c != '.')
+            {
+                return false;
+            }
         }
 
         return true;
@@ -106,7 +137,8 @@ namespace
 
         int Port = 0;
         auto [ptr, ec] = std::from_chars(m_Port.data(), m_Port.data() + m_Port.size(), Port);
-        if (ec != std::errc() || Port <= 0 || Port > 65535)
+        if (ec != std::errc() || ptr != m_Port.data() + m_Port.size() || Port <= 0 ||
+            Port > 65535)
         {
             return false;
         }
@@ -123,6 +155,11 @@ namespace
     clParseURL clParseURL::ParseURL(const std::string& URL)
     {
         clParseURL Result;
+
+        if (containsInvalidUrlCharacter(URL))
+        {
+            return clParseURL(LUrlParserError_UnexpectedEndOfLine);
+        }
 
         const char* CurrentString = URL.c_str();
 
@@ -151,8 +188,10 @@ namespace
             }
 
             // scheme should be lowercase
-            std::transform(
-                Result.m_Scheme.begin(), Result.m_Scheme.end(), Result.m_Scheme.begin(), ::tolower);
+            std::transform(Result.m_Scheme.begin(),
+                           Result.m_Scheme.end(),
+                           Result.m_Scheme.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
 
             // skip ':'
             CurrentString = LocalString + 1;
@@ -180,7 +219,7 @@ namespace
                 bHasUserName = true;
                 break;
             }
-            else if (*LocalString == '/' || *LocalString == '?')
+            else if (*LocalString == '/' || *LocalString == '?' || *LocalString == '#')
             {
                 // end of <host>:<port> specification
                 bHasUserName = false;
@@ -242,7 +281,9 @@ namespace
                 LocalString++;
                 break;
             }
-            else if (!bHasBracket && (*LocalString == ':' || *LocalString == '/' || *LocalString == '?'))
+            else if (!bHasBracket &&
+                     (*LocalString == ':' || *LocalString == '/' || *LocalString == '?' ||
+                      *LocalString == '#'))
             {
                 // port number is specified
                 break;
@@ -251,19 +292,39 @@ namespace
             LocalString++;
         }
 
-        Result.m_Host = std::string(CurrentString, LocalString - CurrentString);
+        if (bHasBracket)
+        {
+            if (LocalString == CurrentString || *(LocalString - 1) != ']' ||
+                LocalString - CurrentString <= 2)
+            {
+                return clParseURL(LUrlParserError_UnexpectedEndOfLine);
+            }
+
+            Result.m_Host = std::string(CurrentString + 1, LocalString - CurrentString - 2);
+        }
+        else
+        {
+            Result.m_Host = std::string(CurrentString, LocalString - CurrentString);
+        }
+
+        if (Result.m_Host.empty())
+        {
+            return clParseURL(LUrlParserError_UnexpectedEndOfLine);
+        }
 
         CurrentString = LocalString;
 
         // is port number specified?
         if (*CurrentString == ':')
         {
+            Result.m_HasPort = true;
             CurrentString++;
 
             // read port number
             LocalString = CurrentString;
 
-            while (*LocalString && *LocalString != '/')
+            while (*LocalString && *LocalString != '/' && *LocalString != '?' &&
+                   *LocalString != '#')
                 LocalString++;
 
             Result.m_Port = std::string(CurrentString, LocalString - CurrentString);
@@ -280,12 +341,13 @@ namespace
         }
 
         // skip '/'
-        if (*CurrentString != '/' && *CurrentString != '?')
+        if (*CurrentString != '/' && *CurrentString != '?' && *CurrentString != '#')
         {
             return clParseURL(LUrlParserError_NoSlash);
         }
 
-        if (*CurrentString != '?') {
+        if (*CurrentString == '/')
+        {
             CurrentString++;
         }
 
@@ -384,7 +446,14 @@ namespace ix
         query = res.m_Query;
 
         const auto protocolPort = getProtocolPort(protocol);
-        if (!res.GetPort(&port))
+        if (res.m_HasPort)
+        {
+            if (!res.GetPort(&port))
+            {
+                return false;
+            }
+        }
+        else
         {
             port = protocolPort;
         }
@@ -427,7 +496,14 @@ namespace ix
         username = res.m_UserName;
         password = res.m_Password;
 
-        if (!res.GetPort(&port))
+        if (res.m_HasPort)
+        {
+            if (!res.GetPort(&port))
+            {
+                return false;
+            }
+        }
+        else
         {
             port = getProtocolPort(protocol);
         }

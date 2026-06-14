@@ -11,8 +11,11 @@
 #include "IXSelectInterrupt.h"
 #include "IXSelectInterruptFactory.h"
 #include "IXSocketConnect.h"
+#include "IXSocketFactory.h"
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <limits>
 #include <optional>
 #include <fcntl.h>
 #include <string.h>
@@ -25,6 +28,65 @@
 
 namespace ix
 {
+    namespace
+    {
+        constexpr int kIoPollIntervalMs = 100;
+
+        class SocketIoDeadline
+        {
+        public:
+            explicit SocketIoDeadline(int timeoutSecs)
+                : _hasDeadline(timeoutSecs > 0)
+                , _deadline(std::chrono::steady_clock::now() + std::chrono::seconds(timeoutSecs))
+            {
+            }
+
+            bool expired() const
+            {
+                return _hasDeadline && std::chrono::steady_clock::now() >= _deadline;
+            }
+
+            int pollTimeoutMs() const
+            {
+                if (!_hasDeadline)
+                {
+                    return kIoPollIntervalMs;
+                }
+
+                auto now = std::chrono::steady_clock::now();
+                if (now >= _deadline)
+                {
+                    return 0;
+                }
+
+                auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     _deadline - now)
+                                     .count();
+                if (remaining > kIoPollIntervalMs)
+                {
+                    return kIoPollIntervalMs;
+                }
+
+                return static_cast<int>(std::max<int64_t>(remaining, 1));
+            }
+
+        private:
+            bool _hasDeadline;
+            std::chrono::time_point<std::chrono::steady_clock> _deadline;
+        };
+
+        bool isSocketIoCancellationRequested(const CancellationRequest& isCancellationRequested,
+                                             const SocketIoDeadline& deadline)
+        {
+            if (isCancellationRequested && isCancellationRequested())
+            {
+                return true;
+            }
+
+            return deadline.expired();
+        }
+    } // namespace
+
     const int Socket::kDefaultPollNoTimeout = -1; // No poll timeout by default
     const int Socket::kDefaultPollTimeout = kDefaultPollNoTimeout;
 
@@ -175,6 +237,14 @@ namespace ix
 
     PollResultType Socket::isReadyToRead(int timeoutMs)
     {
+        {
+            std::lock_guard<std::mutex> lock(_socketMutex);
+            if (_proxySocket)
+            {
+                return _proxySocket->isReadyToRead(timeoutMs);
+            }
+        }
+
         if (_sockfd == -1)
         {
             return PollResultType::Error;
@@ -186,6 +256,14 @@ namespace ix
 
     PollResultType Socket::isReadyToWrite(int timeoutMs)
     {
+        {
+            std::lock_guard<std::mutex> lock(_socketMutex);
+            if (_proxySocket)
+            {
+                return _proxySocket->isReadyToWrite(timeoutMs);
+            }
+        }
+
         if (_sockfd == -1)
         {
             return PollResultType::Error;
@@ -198,11 +276,25 @@ namespace ix
     // Wake up from poll/select by writing to the pipe which is watched by select
     bool Socket::wakeUpFromPoll(uint64_t wakeUpCode)
     {
+        std::lock_guard<std::mutex> lock(_socketMutex);
+
+        if (_proxySocket)
+        {
+            return _proxySocket->wakeUpFromPoll(wakeUpCode);
+        }
+
         return _selectInterrupt->notify(wakeUpCode);
     }
 
     bool Socket::isWakeUpFromPollSupported()
     {
+        std::lock_guard<std::mutex> lock(_socketMutex);
+
+        if (_proxySocket)
+        {
+            return _proxySocket->isWakeUpFromPollSupported();
+        }
+
         return _selectInterrupt->getFd() != -1 || _selectInterrupt->getEvent() != nullptr;
     }
 
@@ -216,6 +308,13 @@ namespace ix
         return true;
     }
 
+    bool Socket::accept(std::string& errMsg,
+                        const CancellationRequest& isCancellationRequested)
+    {
+        (void) isCancellationRequested;
+        return accept(errMsg);
+    }
+
     bool Socket::connect(const std::string& host,
                          int port,
                          std::string& errMsg,
@@ -225,13 +324,69 @@ namespace ix
 
         if (!_selectInterrupt->clear()) return false;
 
+        if (_proxySocket)
+        {
+            _proxySocket->close();
+            _proxySocket.reset();
+            _sockfd = -1;
+        }
+        else if (_sockfd != -1)
+        {
+            closeSocket(_sockfd);
+            _sockfd = -1;
+        }
+
         if (_proxyConfig.isEnabled())
         {
+            if (_proxyConfig.type == ProxyType::Https)
+            {
+                return connectThroughSecureProxy(host, port, errMsg, isCancellationRequested);
+            }
+
             return connectThroughProxy(host, port, errMsg, isCancellationRequested);
         }
 
         _sockfd = SocketConnect::connect(host, port, errMsg, isCancellationRequested);
         return _sockfd != -1;
+    }
+
+    bool Socket::connectThroughSecureProxy(const std::string& host,
+                                           int port,
+                                           std::string& errMsg,
+                                           const CancellationRequest& isCancellationRequested)
+    {
+        SocketTLSOptions tlsOptions = _proxyConfig.tlsOptions;
+        std::string proxySocketErrMsg;
+        auto proxySocket = createSocket(true, -1, proxySocketErrMsg, tlsOptions);
+        if (!proxySocket)
+        {
+            errMsg = proxySocketErrMsg.empty() ? "Cannot create secure proxy socket"
+                                               : proxySocketErrMsg;
+            return false;
+        }
+
+        proxySocket->setProxyConfig(ProxyConfig{});
+        if (!proxySocket->connect(
+                _proxyConfig.host, _proxyConfig.port, errMsg, isCancellationRequested))
+        {
+            return false;
+        }
+
+        if (!ProxyConnect::connect(
+                *proxySocket, _proxyConfig, host, port, errMsg, isCancellationRequested))
+        {
+            proxySocket->close();
+            return false;
+        }
+
+        _sockfd = proxySocket->getFd();
+        _proxySocket = std::move(proxySocket);
+        return true;
+    }
+
+    Socket* Socket::getProxySocket() const
+    {
+        return _proxySocket.get();
     }
 
     bool Socket::connectThroughProxy(const std::string& host,
@@ -246,7 +401,10 @@ namespace ix
         if (!ProxyConnect::connect(_sockfd, _proxyConfig, host, port,
                                    errMsg, isCancellationRequested))
         {
-            close();
+            // connect() already holds _socketMutex, so close the fd directly
+            // to avoid locking _socketMutex again through close().
+            closeSocket(_sockfd);
+            _sockfd = -1;
             return false;
         }
         return true;
@@ -266,6 +424,14 @@ namespace ix
     {
         std::lock_guard<std::mutex> lock(_socketMutex);
 
+        if (_proxySocket)
+        {
+            _proxySocket->close();
+            _proxySocket.reset();
+            _sockfd = -1;
+            return;
+        }
+
         if (_sockfd == -1) return;
 
         closeSocket(_sockfd);
@@ -274,17 +440,48 @@ namespace ix
 
     bool Socket::isOpen() const
     {
+        std::lock_guard<std::mutex> lock(_socketMutex);
+
+        if (_proxySocket)
+        {
+            return _proxySocket->isOpen();
+        }
+
         return _sockfd != -1;
+    }
+
+    int Socket::getFd() const
+    {
+        return _sockfd.load();
     }
 
     IoResult Socket::send(const char* buffer, size_t length)
     {
+        std::lock_guard<std::mutex> lock(_socketMutex);
+
+        if (_proxySocket)
+        {
+            return _proxySocket->send(buffer, length);
+        }
+
+        if (_sockfd == -1)
+        {
+            return {0, IoError::ConnectionClosed};
+        }
+
+        if (length == 0)
+        {
+            return {0, IoError::Success};
+        }
+
         int flags = 0;
 #ifdef MSG_NOSIGNAL
         flags = MSG_NOSIGNAL;
 #endif
 
-        auto ret = ::send(_sockfd, buffer, length, flags);
+        const size_t ioLength =
+            std::min(length, static_cast<size_t>(std::numeric_limits<int>::max()));
+        auto ret = ::send(_sockfd, buffer, ioLength, flags);
         if (ret > 0) return {static_cast<size_t>(ret), IoError::Success};
         if (ret == 0) return {0, IoError::ConnectionClosed};
         if (isWaitNeeded()) return {0, IoError::WouldBlock};
@@ -298,12 +495,31 @@ namespace ix
 
     IoResult Socket::recv(void* buffer, size_t length)
     {
+        std::lock_guard<std::mutex> lock(_socketMutex);
+
+        if (_proxySocket)
+        {
+            return _proxySocket->recv(buffer, length);
+        }
+
+        if (_sockfd == -1)
+        {
+            return {0, IoError::ConnectionClosed};
+        }
+
+        if (length == 0)
+        {
+            return {0, IoError::Success};
+        }
+
         int flags = 0;
 #ifdef MSG_NOSIGNAL
         flags = MSG_NOSIGNAL;
 #endif
 
-        auto ret = ::recv(_sockfd, (char*) buffer, length, flags);
+        const size_t ioLength =
+            std::min(length, static_cast<size_t>(std::numeric_limits<int>::max()));
+        auto ret = ::recv(_sockfd, (char*) buffer, ioLength, flags);
         if (ret > 0) return {static_cast<size_t>(ret), IoError::Success};
         if (ret == 0) return {0, IoError::ConnectionClosed};
         if (isWaitNeeded()) return {0, IoError::WouldBlock};
@@ -352,12 +568,22 @@ namespace ix
     bool Socket::writeBytes(const std::string& str,
                             const CancellationRequest& isCancellationRequested)
     {
+        return writeBytes(str, isCancellationRequested, -1);
+    }
+
+    bool Socket::writeBytes(const std::string& str,
+                            const CancellationRequest& isCancellationRequested,
+                            int timeoutSecs)
+    {
+        if (str.empty()) return true;
+
+        SocketIoDeadline deadline(timeoutSecs);
         size_t offset = 0;
         size_t len = str.size();
 
         while (true)
         {
-            if (isCancellationRequested && isCancellationRequested()) return false;
+            if (isSocketIoCancellationRequested(isCancellationRequested, deadline)) return false;
 
             auto result = send((char*) &str[offset], len);
 
@@ -370,7 +596,12 @@ namespace ix
             }
             if (result.wouldBlock())
             {
-                if (isReadyToWrite(1) == PollResultType::Error) return false;
+                PollResultType pollResult = isReadyToWrite(deadline.pollTimeoutMs());
+                if (pollResult == PollResultType::Error ||
+                    isSocketIoCancellationRequested(isCancellationRequested, deadline))
+                {
+                    return false;
+                }
                 continue;
             }
             return false;
@@ -379,16 +610,17 @@ namespace ix
 
     bool Socket::readByte(void* buffer, const CancellationRequest& isCancellationRequested)
     {
+        SocketIoDeadline deadline(-1);
         while (true)
         {
-            if (isCancellationRequested && isCancellationRequested()) return false;
+            if (isSocketIoCancellationRequested(isCancellationRequested, deadline)) return false;
 
             auto result = recv(buffer, 1);
 
             if (result && result.bytes == 1) return true;
             if (result.wouldBlock())
             {
-                if (isReadyToRead(1) == PollResultType::Error) return false;
+                if (isReadyToRead(deadline.pollTimeoutMs()) == PollResultType::Error) return false;
                 continue;
             }
             return false;
@@ -398,25 +630,50 @@ namespace ix
     std::optional<std::string> Socket::readLine(
         const CancellationRequest& isCancellationRequested)
     {
+        return readLine(isCancellationRequested, -1);
+    }
+
+    std::optional<std::string> Socket::readLine(
+        const CancellationRequest& isCancellationRequested,
+        int timeoutSecs)
+    {
         constexpr size_t maxLineLength = 8192;
+        SocketIoDeadline deadline(timeoutSecs);
         char c;
         std::string line;
         line.reserve(64);
 
         while (line.size() < maxLineLength)
         {
-            if (!readByte(&c, isCancellationRequested))
+            if (isSocketIoCancellationRequested(isCancellationRequested, deadline))
             {
                 return std::nullopt;
             }
 
-            line += c;
-            const size_t currentSize = line.size();
+            auto result = recv(&c, 1);
 
-            if (currentSize >= 2 && line[currentSize - 2] == '\r' && line[currentSize - 1] == '\n')
+            if (result && result.bytes == 1)
             {
-                return line;
+                line += c;
+                const size_t currentSize = line.size();
+
+                if (currentSize >= 2 && line[currentSize - 2] == '\r' &&
+                    line[currentSize - 1] == '\n')
+                {
+                    return line;
+                }
+                continue;
             }
+            if (result.wouldBlock())
+            {
+                PollResultType pollResult = isReadyToRead(deadline.pollTimeoutMs());
+                if (pollResult == PollResultType::Error)
+                {
+                    return std::nullopt;
+                }
+                continue;
+            }
+            return std::nullopt;
         }
 
         return std::nullopt;
@@ -428,17 +685,32 @@ namespace ix
         const OnChunkCallback& onChunkCallback,
         const CancellationRequest& isCancellationRequested)
     {
+        return readBytes(length, onProgressCallback, onChunkCallback, isCancellationRequested, -1);
+    }
+
+    std::optional<std::string> Socket::readBytes(
+        size_t length,
+        const OnProgressCallback& onProgressCallback,
+        const OnChunkCallback& onChunkCallback,
+        const CancellationRequest& isCancellationRequested,
+        int timeoutSecs)
+    {
         std::array<uint8_t, 1 << 14> readBuffer;
-        std::vector<uint8_t> output;
+        std::string output;
         if (!onChunkCallback)
         {
+            if (length > output.max_size())
+            {
+                return std::nullopt;
+            }
             output.reserve(length);
         }
+        SocketIoDeadline deadline(timeoutSecs);
         size_t bytesRead = 0;
 
         while (bytesRead != length)
         {
-            if (isCancellationRequested && isCancellationRequested())
+            if (isSocketIoCancellationRequested(isCancellationRequested, deadline))
             {
                 return std::nullopt;
             }
@@ -450,20 +722,32 @@ namespace ix
             {
                 if (onChunkCallback)
                 {
-                    std::string chunk(readBuffer.begin(), readBuffer.begin() + result.bytes);
+                    std::string chunk(reinterpret_cast<char*>(readBuffer.data()), result.bytes);
                     onChunkCallback(chunk);
                 }
                 else
                 {
-                    output.insert(output.end(), readBuffer.begin(), readBuffer.begin() + result.bytes);
+                    output.append(reinterpret_cast<char*>(readBuffer.data()), result.bytes);
                 }
                 bytesRead += result.bytes;
 
-                if (onProgressCallback) onProgressCallback((int) bytesRead, (int) length);
+                if (onProgressCallback)
+                {
+                    if (!onProgressCallback(static_cast<uint64_t>(bytesRead),
+                                            static_cast<uint64_t>(length)))
+                    {
+                        return std::nullopt;
+                    }
+                }
             }
             else if (result.wouldBlock())
             {
-                if (isReadyToRead(1) == PollResultType::Error) return std::nullopt;
+                PollResultType pollResult = isReadyToRead(deadline.pollTimeoutMs());
+                if (pollResult == PollResultType::Error ||
+                    isSocketIoCancellationRequested(isCancellationRequested, deadline))
+                {
+                    return std::nullopt;
+                }
             }
             else
             {
@@ -471,6 +755,6 @@ namespace ix
             }
         }
 
-        return std::string(output.begin(), output.end());
+        return output;
     }
 } // namespace ix

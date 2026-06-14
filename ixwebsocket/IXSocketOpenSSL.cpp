@@ -9,10 +9,10 @@
 
 #include "IXSocketOpenSSL.h"
 
-#include "IXProxyConnect.h"
-#include "IXSocketConnect.h"
 #include "IXUniquePtr.h"
+#include <algorithm>
 #include <errno.h>
+#include <limits>
 #include <vector>
 #ifdef _WIN32
 #include <shlwapi.h>
@@ -21,6 +21,9 @@
 #endif
 #if OPENSSL_VERSION_NUMBER < 0x10100000L
 #include <openssl/x509v3.h>
+#define BIO_get_data(bio) ((bio)->ptr)
+#define BIO_set_data(bio, p) ((bio)->ptr = (p))
+#define BIO_set_init(bio, i) ((bio)->init = (i))
 #endif
 #define socketerrno errno
 
@@ -95,6 +98,40 @@ namespace ix
     std::once_flag SocketOpenSSL::_openSSLInitFlag;
     std::vector<std::unique_ptr<std::mutex>> openSSLMutexes;
 
+    namespace
+    {
+        constexpr int kTlsHandshakePollTimeoutMs = 100;
+
+        bool waitForTlsIo(Socket& socket,
+                          int reason,
+                          const CancellationRequest& isCancellationRequested,
+                          std::string& errMsg)
+        {
+            if (isCancellationRequested && isCancellationRequested())
+            {
+                errMsg = "Cancellation requested";
+                return false;
+            }
+
+            PollResultType result = reason == SSL_ERROR_WANT_READ
+                                        ? socket.isReadyToRead(kTlsHandshakePollTimeoutMs)
+                                        : socket.isReadyToWrite(kTlsHandshakePollTimeoutMs);
+            if (result == PollResultType::Error)
+            {
+                errMsg = "TLS handshake socket wait failed";
+                return false;
+            }
+
+            if (isCancellationRequested && isCancellationRequested())
+            {
+                errMsg = "Cancellation requested";
+                return false;
+            }
+
+            return true;
+        }
+    }
+
     SocketOpenSSL::SocketOpenSSL(const SocketTLSOptions& tlsOptions, int fd)
         : Socket(fd)
         , _ssl_connection(nullptr)
@@ -107,6 +144,20 @@ namespace ix
     SocketOpenSSL::~SocketOpenSSL()
     {
         SocketOpenSSL::close();
+    }
+
+    void SocketOpenSSL::cleanupTLS()
+    {
+        if (_ssl_connection != nullptr)
+        {
+            SSL_free(_ssl_connection);
+            _ssl_connection = nullptr;
+        }
+        if (_ssl_context != nullptr)
+        {
+            SSL_CTX_free(_ssl_context);
+            _ssl_context = nullptr;
+        }
     }
 
     void SocketOpenSSL::openSSLInitialize()
@@ -224,18 +275,24 @@ namespace ix
         return ctx;
     }
 
-    bool SocketOpenSSL::openSSLAddCARootsFromString(const std::string roots)
+    bool SocketOpenSSL::openSSLAddCARootsFromString(const std::string& roots)
     {
         // Create certificate store
         X509_STORE* certificate_store = SSL_CTX_get_cert_store(_ssl_context);
         if (certificate_store == nullptr) return false;
+
+        if (roots.size() > static_cast<size_t>(std::numeric_limits<int>::max()))
+        {
+            return false;
+        }
 
         // Configure to allow intermediate certs
         X509_STORE_set_flags(certificate_store,
                              X509_V_FLAG_TRUSTED_FIRST | X509_V_FLAG_PARTIAL_CHAIN);
 
         // Create a new buffer and populate it with the roots
-        BIO* buffer = BIO_new_mem_buf((void*) roots.c_str(), static_cast<int>(roots.length()));
+        BIO* buffer =
+            BIO_new_mem_buf(const_cast<char*>(roots.data()), static_cast<int>(roots.size()));
         if (buffer == nullptr) return false;
 
         // Read each root in the buffer and add to the certificate store
@@ -369,6 +426,7 @@ namespace ix
         if (!hostname_verifies_ok)
         {
             errMsg = "OpenSSL failed - certificate was issued for a different domain.";
+            X509_free(server_cert);
             return false;
         }
 #endif
@@ -388,7 +446,7 @@ namespace ix
                 return false;
             }
 
-            if (isCancellationRequested())
+            if (isCancellationRequested && isCancellationRequested())
             {
                 errMsg = "Cancellation requested";
                 return false;
@@ -410,7 +468,7 @@ namespace ix
             bool rc = false;
             if (reason == SSL_ERROR_WANT_READ || reason == SSL_ERROR_WANT_WRITE)
             {
-                rc = true;
+                rc = waitForTlsIo(*this, reason, isCancellationRequested, errMsg);
             }
             else
             {
@@ -425,12 +483,19 @@ namespace ix
         }
     }
 
-    bool SocketOpenSSL::openSSLServerHandshake(std::string& errMsg)
+    bool SocketOpenSSL::openSSLServerHandshake(
+        std::string& errMsg, const CancellationRequest& isCancellationRequested)
     {
         while (true)
         {
             if (_ssl_connection == nullptr || _ssl_context == nullptr)
             {
+                return false;
+            }
+
+            if (isCancellationRequested && isCancellationRequested())
+            {
+                errMsg = "Cancellation requested";
                 return false;
             }
 
@@ -445,7 +510,7 @@ namespace ix
             bool rc = false;
             if (reason == SSL_ERROR_WANT_READ || reason == SSL_ERROR_WANT_WRITE)
             {
-                rc = true;
+                rc = waitForTlsIo(*this, reason, isCancellationRequested, errMsg);
             }
             else
             {
@@ -460,6 +525,155 @@ namespace ix
         }
     }
 
+    int SocketOpenSSL::socketBioWrite(BIO* bio, const char* data, int dataLen)
+    {
+        if (dataLen <= 0 || data == nullptr)
+        {
+            return 0;
+        }
+
+        auto* socket = static_cast<Socket*>(BIO_get_data(bio));
+        if (socket == nullptr)
+        {
+            return 0;
+        }
+
+        BIO_clear_retry_flags(bio);
+
+        auto result = socket->send(data, static_cast<size_t>(dataLen));
+        if (result)
+        {
+            return static_cast<int>(result.bytes);
+        }
+
+        if (result.wouldBlock())
+        {
+            BIO_set_retry_write(bio);
+        }
+
+        return -1;
+    }
+
+    int SocketOpenSSL::socketBioRead(BIO* bio, char* data, int dataLen)
+    {
+        if (dataLen <= 0 || data == nullptr)
+        {
+            return 0;
+        }
+
+        auto* socket = static_cast<Socket*>(BIO_get_data(bio));
+        if (socket == nullptr)
+        {
+            return 0;
+        }
+
+        BIO_clear_retry_flags(bio);
+
+        auto result = socket->recv(data, static_cast<size_t>(dataLen));
+        if (result)
+        {
+            return static_cast<int>(result.bytes);
+        }
+
+        if (result.wouldBlock())
+        {
+            BIO_set_retry_read(bio);
+            return -1;
+        }
+
+        if (result.closed())
+        {
+            return 0;
+        }
+
+        return -1;
+    }
+
+    long SocketOpenSSL::socketBioCtrl(BIO* /*bio*/, int cmd, long /*num*/, void* /*ptr*/)
+    {
+        if (cmd == BIO_CTRL_FLUSH)
+        {
+            return 1;
+        }
+
+        return 0;
+    }
+
+    int SocketOpenSSL::socketBioCreate(BIO* bio)
+    {
+        BIO_set_init(bio, 1);
+        BIO_set_data(bio, nullptr);
+        return 1;
+    }
+
+    int SocketOpenSSL::socketBioDestroy(BIO* bio)
+    {
+        if (bio == nullptr)
+        {
+            return 0;
+        }
+
+        BIO_set_data(bio, nullptr);
+        BIO_set_init(bio, 0);
+        return 1;
+    }
+
+    BIO_METHOD* SocketOpenSSL::getSocketBioMethod()
+    {
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+        return nullptr;
+#else
+        static BIO_METHOD* method = nullptr;
+        static std::once_flag socketBioInitFlag;
+
+        std::call_once(socketBioInitFlag, []() {
+            method = BIO_meth_new(BIO_TYPE_SOURCE_SINK, "ixwebsocket_socket_bio");
+            BIO_meth_set_write(method, &SocketOpenSSL::socketBioWrite);
+            BIO_meth_set_read(method, &SocketOpenSSL::socketBioRead);
+            BIO_meth_set_ctrl(method, &SocketOpenSSL::socketBioCtrl);
+            BIO_meth_set_create(method, &SocketOpenSSL::socketBioCreate);
+            BIO_meth_set_destroy(method, &SocketOpenSSL::socketBioDestroy);
+        });
+
+        return method;
+#endif
+    }
+
+    bool SocketOpenSSL::attachConnectionIO(std::string& errMsg)
+    {
+        if (getProxySocket())
+        {
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+            errMsg = "HTTPS proxy is not supported with OpenSSL < 1.1";
+            return false;
+#else
+            BIO_METHOD* method = getSocketBioMethod();
+            if (method == nullptr)
+            {
+                errMsg = "Cannot initialize OpenSSL proxy BIO method";
+                return false;
+            }
+
+            BIO* bio = BIO_new(method);
+            if (bio == nullptr)
+            {
+                auto sslErr = ERR_get_error();
+                errMsg = "OpenSSL failed - BIO_new for proxy stream failed: ";
+                errMsg += ERR_error_string(sslErr, nullptr);
+                return false;
+            }
+
+            BIO_set_data(bio, getProxySocket());
+            BIO_set_init(bio, 1);
+            SSL_set_bio(_ssl_connection, bio, bio);
+            return true;
+#endif
+        }
+
+        SSL_set_fd(_ssl_connection, _sockfd);
+        return true;
+    }
+
     bool SocketOpenSSL::handleTLSOptions(std::string& errMsg)
     {
         ERR_clear_error();
@@ -471,6 +685,7 @@ namespace ix
                 errMsg = "OpenSSL failed - SSL_CTX_use_certificate_chain_file(\"" +
                          _tlsOptions.certFile + "\") failed: ";
                 errMsg += ERR_error_string(sslErr, nullptr);
+                return false;
             }
             else if (SSL_CTX_use_PrivateKey_file(
                          _ssl_context, _tlsOptions.keyFile.c_str(), SSL_FILETYPE_PEM) != 1)
@@ -479,6 +694,7 @@ namespace ix
                 errMsg = "OpenSSL failed - SSL_CTX_use_PrivateKey_file(\"" + _tlsOptions.keyFile +
                          "\") failed: ";
                 errMsg += ERR_error_string(sslErr, nullptr);
+                return false;
             }
             else if (!SSL_CTX_check_private_key(_ssl_context))
             {
@@ -486,6 +702,7 @@ namespace ix
                 errMsg = "OpenSSL failed - cert/key mismatch(\"" + _tlsOptions.certFile + ", " +
                          _tlsOptions.keyFile + "\")";
                 errMsg += ERR_error_string(sslErr, nullptr);
+                return false;
             }
         }
 
@@ -514,7 +731,11 @@ namespace ix
                 if (_tlsOptions.isUsingInMemoryCAs())
                 {
                     // Load from memory
-                    openSSLAddCARootsFromString(_tlsOptions.caFile);
+                    if (!openSSLAddCARootsFromString(_tlsOptions.caFile))
+                    {
+                        errMsg = "OpenSSL failed - could not load in-memory CA roots";
+                        return false;
+                    }
                 }
                 else
                 {
@@ -565,14 +786,25 @@ namespace ix
 
     bool SocketOpenSSL::accept(std::string& errMsg)
     {
+        return accept(errMsg, nullptr);
+    }
+
+    bool SocketOpenSSL::accept(std::string& errMsg,
+                               const CancellationRequest& isCancellationRequested)
+    {
         bool handshakeSuccessful = false;
         {
             std::lock_guard<std::mutex> lock(_mutex);
+            auto fail = [this]() {
+                cleanupTLS();
+                Socket::close();
+                return false;
+            };
 
             if (!_openSSLInitializationSuccessful)
             {
                 errMsg = "OPENSSL_init_ssl failure";
-                return false;
+                return fail();
             }
 
             if (_sockfd == -1)
@@ -604,7 +836,7 @@ namespace ix
 
             if (_ssl_context == nullptr)
             {
-                return false;
+                return fail();
             }
 
             ERR_clear_error();
@@ -617,6 +849,7 @@ namespace ix
                     errMsg = "OpenSSL failed - SSL_CTX_use_certificate_chain_file(\"" +
                              _tlsOptions.certFile + "\") failed: ";
                     errMsg += ERR_error_string(sslErr, nullptr);
+                    return fail();
                 }
                 else if (SSL_CTX_use_PrivateKey_file(
                              _ssl_context, _tlsOptions.keyFile.c_str(), SSL_FILETYPE_PEM) != 1)
@@ -625,6 +858,7 @@ namespace ix
                     errMsg = "OpenSSL failed - SSL_CTX_use_PrivateKey_file(\"" +
                              _tlsOptions.keyFile + "\") failed: ";
                     errMsg += ERR_error_string(sslErr, nullptr);
+                    return fail();
                 }
             }
 
@@ -639,6 +873,7 @@ namespace ix
                         auto sslErr = ERR_get_error();
                         errMsg = "OpenSSL failed - SSL_CTX_default_verify_paths loading failed: ";
                         errMsg += ERR_error_string(sslErr, nullptr);
+                        return fail();
                     }
                 }
                 else
@@ -646,7 +881,11 @@ namespace ix
                     if (_tlsOptions.isUsingInMemoryCAs())
                     {
                         // Load from memory
-                        openSSLAddCARootsFromString(_tlsOptions.caFile);
+                        if (!openSSLAddCARootsFromString(_tlsOptions.caFile))
+                        {
+                            errMsg = "OpenSSL failed - could not load in-memory CA roots";
+                            return fail();
+                        }
                     }
                     else
                     {
@@ -659,6 +898,7 @@ namespace ix
                             errMsg = "OpenSSL failed - SSL_load_client_CA_file('" +
                                      _tlsOptions.caFile + "') failed: ";
                             errMsg += ERR_error_string(sslErr, nullptr);
+                            return fail();
                         }
                         else
                         {
@@ -670,6 +910,7 @@ namespace ix
                                 errMsg = "OpenSSL failed - SSL_CTX_load_verify_locations(\"" +
                                          _tlsOptions.caFile + "\") failed: ";
                                 errMsg += ERR_error_string(sslErr, nullptr);
+                                return fail();
                             }
                         }
                     }
@@ -687,28 +928,26 @@ namespace ix
             {
                 if (SSL_CTX_set_cipher_list(_ssl_context, kDefaultCiphers.c_str()) != 1)
                 {
-                    return false;
+                    return fail();
                 }
             }
             else if (SSL_CTX_set_cipher_list(_ssl_context, _tlsOptions.ciphers.c_str()) != 1)
             {
-                return false;
+                return fail();
             }
 
             _ssl_connection = SSL_new(_ssl_context);
             if (_ssl_connection == nullptr)
             {
                 errMsg = "OpenSSL failed to connect";
-                SSL_CTX_free(_ssl_context);
-                _ssl_context = nullptr;
-                return false;
+                return fail();
             }
 
             SSL_set_ecdh_auto(_ssl_connection, 1);
 
             SSL_set_fd(_ssl_connection, _sockfd);
 
-            handshakeSuccessful = openSSLServerHandshake(errMsg);
+            handshakeSuccessful = openSSLServerHandshake(errMsg, isCancellationRequested);
         }
 
         if (!handshakeSuccessful)
@@ -735,33 +974,19 @@ namespace ix
                 return false;
             }
 
-            if (_proxyConfig.isEnabled())
-            {
-                _sockfd = SocketConnect::connect(_proxyConfig.host, _proxyConfig.port,
-                                                 errMsg, isCancellationRequested);
-                if (_sockfd == -1) return false;
-
-                if (!ProxyConnect::connect(_sockfd, _proxyConfig, host, port,
-                                           errMsg, isCancellationRequested))
-                {
-                    Socket::close();
-                    return false;
-                }
-            }
-            else
-            {
-                _sockfd = SocketConnect::connect(host, port, errMsg, isCancellationRequested);
-                if (_sockfd == -1) return false;
-            }
+            if (!Socket::connect(host, port, errMsg, isCancellationRequested)) return false;
 
             _ssl_context = openSSLCreateContext(errMsg);
             if (_ssl_context == nullptr)
             {
+                Socket::close();
                 return false;
             }
 
             if (!handleTLSOptions(errMsg))
             {
+                cleanupTLS();
+                Socket::close();
                 return false;
             }
 
@@ -769,11 +994,17 @@ namespace ix
             if (_ssl_connection == nullptr)
             {
                 errMsg = "OpenSSL failed to connect";
-                SSL_CTX_free(_ssl_context);
-                _ssl_context = nullptr;
+                cleanupTLS();
+                Socket::close();
                 return false;
             }
-            SSL_set_fd(_ssl_connection, _sockfd);
+
+            if (!attachConnectionIO(errMsg))
+            {
+                cleanupTLS();
+                Socket::close();
+                return false;
+            }
 
             // SNI support
             SSL_set_tlsext_host_name(_ssl_connection, host.c_str());
@@ -805,17 +1036,7 @@ namespace ix
     {
         std::lock_guard<std::mutex> lock(_mutex);
 
-        if (_ssl_connection != nullptr)
-        {
-            SSL_free(_ssl_connection);
-            _ssl_connection = nullptr;
-        }
-        if (_ssl_context != nullptr)
-        {
-            SSL_CTX_free(_ssl_context);
-            _ssl_context = nullptr;
-        }
-
+        cleanupTLS();
         Socket::close();
     }
 
@@ -828,8 +1049,11 @@ namespace ix
             return {0, IoError::ConnectionClosed};
         }
 
+        const int writeSize =
+            static_cast<int>(std::min(nbyte, static_cast<size_t>(std::numeric_limits<int>::max())));
+
         ERR_clear_error();
-        int write_result = SSL_write(_ssl_connection, buf, (int) nbyte);
+        int write_result = SSL_write(_ssl_connection, buf, writeSize);
         int reason = SSL_get_error(_ssl_connection, write_result);
 
         if (reason == SSL_ERROR_NONE)
@@ -852,8 +1076,11 @@ namespace ix
             return {0, IoError::ConnectionClosed};
         }
 
+        const int readSize =
+            static_cast<int>(std::min(nbyte, static_cast<size_t>(std::numeric_limits<int>::max())));
+
         ERR_clear_error();
-        int read_result = SSL_read(_ssl_connection, buf, (int) nbyte);
+        int read_result = SSL_read(_ssl_connection, buf, readSize);
 
         if (read_result > 0)
         {

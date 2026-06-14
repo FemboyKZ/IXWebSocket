@@ -7,8 +7,11 @@
 #include "IXWebSocketPerMessageDeflateOptions.h"
 
 #include <algorithm>
+#include <charconv>
 #include <cctype>
 #include <sstream>
+#include <string_view>
+#include <system_error>
 
 namespace ix
 {
@@ -21,6 +24,36 @@ namespace ix
     static const uint8_t minClientMaxWindowBits = 8;
     static const uint8_t maxClientMaxWindowBits = 15;
 
+    namespace
+    {
+        uint8_t clampWindowBitsValue(int value, uint8_t minValue, uint8_t maxValue)
+        {
+            if (value < static_cast<int>(minValue))
+            {
+                return minValue;
+            }
+
+            if (value > static_cast<int>(maxValue))
+            {
+                return maxValue;
+            }
+
+            return static_cast<uint8_t>(value);
+        }
+
+        uint8_t parseWindowBitsValue(std::string_view value, uint8_t minValue, uint8_t maxValue)
+        {
+            int parsed = 0;
+            auto [ptr, ec] = std::from_chars(value.data(), value.data() + value.size(), parsed);
+            if (value.empty() || ec != std::errc() || ptr != value.data() + value.size())
+            {
+                return minValue;
+            }
+
+            return clampWindowBitsValue(parsed, minValue, maxValue);
+        }
+    } // namespace
+
     WebSocketPerMessageDeflateOptions::WebSocketPerMessageDeflateOptions(
         bool enabled,
         bool clientNoContextTakeover,
@@ -31,8 +64,12 @@ namespace ix
         _enabled = enabled;
         _clientNoContextTakeover = clientNoContextTakeover;
         _serverNoContextTakeover = serverNoContextTakeover;
-        _clientMaxWindowBits = clientMaxWindowBits;
-        _serverMaxWindowBits = serverMaxWindowBits;
+        _clientMaxWindowBits = clampWindowBitsValue(clientMaxWindowBits,
+                                                    minClientMaxWindowBits,
+                                                    maxClientMaxWindowBits);
+        _serverMaxWindowBits = clampWindowBitsValue(serverMaxWindowBits,
+                                                    minServerMaxWindowBits,
+                                                    maxServerMaxWindowBits);
 
         sanitizeClientMaxWindowBits();
     }
@@ -51,6 +88,11 @@ namespace ix
     // Sec-WebSocket-Extensions: permessage-deflate; client_no_context_takeover;
     // server_no_context_takeover
     //
+    WebSocketPerMessageDeflateOptions::WebSocketPerMessageDeflateOptions(const char* extension)
+        : WebSocketPerMessageDeflateOptions(std::string(extension == nullptr ? "" : extension))
+    {
+    }
+
     WebSocketPerMessageDeflateOptions::WebSocketPerMessageDeflateOptions(std::string extension)
     {
         extension = removeSpaces(extension);
@@ -85,22 +127,22 @@ namespace ix
 
             if (startsWith(token, "server_max_window_bits="))
             {
-                uint8_t x = strtol(token.substr(token.find_last_of("=") + 1).c_str(), nullptr, 10);
-
                 // Sanitize values to be in the proper range [8, 15] in
                 // case a server would give us bogus values
-                _serverMaxWindowBits =
-                    std::min(maxServerMaxWindowBits, std::max(x, minServerMaxWindowBits));
+                _serverMaxWindowBits = parseWindowBitsValue(
+                    std::string_view(token).substr(sizeof("server_max_window_bits=") - 1),
+                    minServerMaxWindowBits,
+                    maxServerMaxWindowBits);
             }
 
             if (startsWith(token, "client_max_window_bits="))
             {
-                uint8_t x = strtol(token.substr(token.find_last_of("=") + 1).c_str(), nullptr, 10);
-
                 // Sanitize values to be in the proper range [8, 15] in
                 // case a server would give us bogus values
-                _clientMaxWindowBits =
-                    std::min(maxClientMaxWindowBits, std::max(x, minClientMaxWindowBits));
+                _clientMaxWindowBits = parseWindowBitsValue(
+                    std::string_view(token).substr(sizeof("client_max_window_bits=") - 1),
+                    minClientMaxWindowBits,
+                    maxClientMaxWindowBits);
 
                 sanitizeClientMaxWindowBits();
             }
