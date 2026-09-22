@@ -6,6 +6,7 @@
 
 #include "IXHttpConnectionPool.h"
 #include "IXSocketFactory.h"
+#include <algorithm>
 
 namespace ix
 {
